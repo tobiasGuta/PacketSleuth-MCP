@@ -8,12 +8,8 @@ from typing import Literal
 
 from mcp.server import MCPServer
 
+from packetsleuth import forensics
 from packetsleuth.core import CaptureStore, InvestigationEngine
-from packetsleuth.forensics import (
-    QUERY_FIELDS, identify_stream_content as _identify_stream_content,
-    query_packets as _query_packets, reconstruct_tcp as _reconstruct_tcp,
-    verify_stream_range as _verify_stream_range,
-)
 
 capture_root = Path(os.environ.get("PACKETSLEUTH_CAPTURE_DIR", "./captures"))
 engine = InvestigationEngine(CaptureStore(capture_root))
@@ -117,7 +113,7 @@ def verify_evidence(
 @mcp.tool()
 def list_query_fields() -> dict:
     """List safe decoded packet fields supported by protocol-neutral searches."""
-    return {"fields": sorted(QUERY_FIELDS), "note": "No caller-defined TShark expressions."}
+    return {"fields": sorted(forensics.QUERY_FIELDS), "note": "No caller-defined TShark expressions."}
 
 
 @mcp.tool()
@@ -130,7 +126,7 @@ def query_packets(
     expected_sha256: str | None = None,
 ) -> dict:
     """Search safe decoded fields; resume with next_start_frame for bounded result pages."""
-    return _query_packets(
+    return forensics.query_packets(
         engine, capture_id, fields, match_field, match_value, match_mode,
         host_ip, start_frame, scan_frames, limit, expected_sha256,
     )
@@ -144,7 +140,7 @@ def reconstruct_tcp(
     expected_sha256: str | None = None,
 ) -> dict:
     """Reassemble bounded one-direction TCP bytes; report gaps, overlaps, frame provenance."""
-    return _reconstruct_tcp(
+    return forensics.reconstruct_tcp(
         engine, capture_id, stream_id, source_ip, source_port, start_frame,
         scan_frames, byte_offset, max_bytes, expected_sha256,
     )
@@ -158,7 +154,7 @@ def identify_stream_content(
     expected_sha256: str | None = None,
 ) -> dict:
     """Recognize generic file/protocol signatures at a reassembled stream byte offset."""
-    return _identify_stream_content(
+    return forensics.identify_stream_content(
         engine, capture_id, stream_id, source_ip, source_port,
         start_frame, scan_frames, byte_offset, expected_sha256,
     )
@@ -172,7 +168,7 @@ def verify_stream_range(
     max_bytes: int = 2048, expected_sha256: str | None = None,
 ) -> dict:
     """Recompute hash of a selected TCP byte range against capture evidence."""
-    return _verify_stream_range(
+    return forensics.verify_stream_range(
         engine, capture_id, stream_id, expected_range_sha256, source_ip,
         source_port, start_frame, scan_frames, byte_offset, max_bytes,
         expected_sha256,

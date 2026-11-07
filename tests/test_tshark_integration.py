@@ -82,7 +82,7 @@ def test_pcap_tcp_payload_and_stream_parsing(tmp_path):
 
 def test_generic_query_and_out_of_order_reconstruction(tmp_path):
     """No CTF fixture: recover deliberately out-of-order generic TCP bytes."""
-    from packetsleuth.forensics import query_packets, reconstruct_tcp, identify_stream_content
+    from packetsleuth.forensics import identify_stream_content, query_packets, reconstruct_tcp
 
     path = tmp_path / "reorder.pcap"
     frames = [
