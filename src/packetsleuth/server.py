@@ -94,11 +94,13 @@ def reconstruct_icmp_flow(
     protocol: Literal["icmpv4", "icmpv6"] | None = None,
     max_packets: int = 16,
     reconstruction_mode: Literal["none", "request", "reply"] = "none",
+    candidate_source_ip: str | None = None,
 ) -> dict:
     """Bounded Echo request/reply correlation; optional candidate-only concatenation."""
     return icmp_flow.reconstruct_icmp_flow(
         engine, capture_id, expected_sha256, start_frame, scan_frames,
         host_ip, peer_ip, identifier, protocol, max_packets, reconstruction_mode,
+        candidate_source_ip,
     )
 
 

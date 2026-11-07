@@ -143,7 +143,13 @@ Ambiguous pairings are not silently paired.
 By default, `reconstruction_mode="none"` returns **no concatenated data**.
 Opt in to `reconstruction_mode="request"` or `"reply"` to receive a
 **candidate-only** hex concatenation, in ascending sequence order, limited to
-8,192 bytes. The tool refuses to concatenate across missing sequences,
+8,192 bytes. If Echo messages of the selected kind originate from both ends of
+the endpoint pair, the tool returns `source_direction_required` rather than
+silently combining them. Pass `candidate_source_ip` to select one sender;
+this option does not remove packets from the correlation summary. Candidate
+metadata also reports whether all included payloads are identical, since repeated
+data does not establish independent chunks. The tool refuses to concatenate
+across missing sequences,
 conflicting duplicate sequences, truncated packet payloads, or ambiguous
 16-bit sequence wrap. Identical duplicates with the same kind/sequence are
 deduplicated and explicitly reported. Sequence numbers are **message IDs**,

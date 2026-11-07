@@ -171,3 +171,55 @@ def test_validation(tmp_path, monkeypatch):
         reconstruct_icmp_flow(engine, capture, pin, protocol="tcp")
     with pytest.raises(PacketSleuthError, match="host_ip"):
         reconstruct_icmp_flow(engine, capture, pin, peer_ip="192.0.2.1")
+
+
+def test_two_request_origins_require_explicit_direction(tmp_path, monkeypatch):
+    # Same Echo identifier in both directions must never become a combined blob.
+    a, b = "192.0.2.10", "198.51.100.22"
+    rows = [
+        row(1, seq=5, src=a, dst=b),
+        row(2, seq=6, src=b, dst=a),
+    ]
+    engine, capture, pin = case(tmp_path, monkeypatch, rows, {1: b"A", 2: b"B"})
+    unspecified = reconstruct_icmp_flow(
+        engine, capture, pin, scan_frames=2, reconstruction_mode="request",
+    )
+    assert unspecified["status"] == "correlated_window"
+    candidate = unspecified["candidate"]
+    assert candidate["status"] == "source_direction_required"
+    assert len(candidate["source_directions"]) == 2
+    assert "data_hex" not in candidate
+
+    left = reconstruct_icmp_flow(
+        engine, capture, pin, scan_frames=2, reconstruction_mode="request",
+        candidate_source_ip=a,
+    )
+    assert left["candidate"]["status"] == "candidate_only"
+    assert bytes.fromhex(left["candidate"]["data_hex"]) == b"A"
+    assert left["candidate"]["source_ip"] == a
+
+    right = reconstruct_icmp_flow(
+        engine, capture, pin, scan_frames=2, reconstruction_mode="request",
+        candidate_source_ip=b,
+    )
+    assert bytes.fromhex(right["candidate"]["data_hex"]) == b"B"
+
+    absent = reconstruct_icmp_flow(
+        engine, capture, pin, scan_frames=2, reconstruction_mode="request",
+        candidate_source_ip="203.0.113.99",
+    )
+    assert absent["candidate"]["status"] == "no_packets_in_direction"
+
+
+def test_identical_payloads_are_not_called_independent_chunks(tmp_path, monkeypatch):
+    rows = [row(1, seq=100), row(2, seq=101)]
+    engine, capture, pin = case(tmp_path, monkeypatch, rows)
+    result = reconstruct_icmp_flow(
+        engine, capture, pin, scan_frames=2, reconstruction_mode="request",
+    )
+    candidate = result["candidate"]
+    assert candidate["status"] == "candidate_only"
+    assert candidate["candidate_bytes"] == 6
+    assert candidate["all_payloads_equal"] is True
+    assert candidate["unique_payload_hashes"] == 1
+    assert "Repeated identical payloads" in candidate["note"]

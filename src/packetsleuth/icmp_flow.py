@@ -130,10 +130,30 @@ def _correlate(packets: list[dict]) -> dict:
     }
 
 
-def _candidate(packets: list[dict], kind: str) -> dict:
+def _candidate(
+    packets: list[dict], kind: str, source_ip: str | None = None,
+) -> dict:
     selected = [p for p in packets if p["kind"] == kind]
     if not selected:
         return {"status": "no_packets", "kind": kind}
+    directions = Counter(p["src_ip"] for p in selected)
+    if source_ip is None and len(directions) > 1:
+        return {
+            "status": "source_direction_required", "kind": kind,
+            "source_directions": [
+                {"src_ip": address, "packets": count}
+                for address, count in sorted(directions.items())
+            ],
+            "note": (
+                "Echo messages of the same kind originate from multiple endpoints. "
+                "Specify candidate_source_ip to avoid merging different directions."
+            ),
+        }
+    if source_ip is not None:
+        selected = [p for p in selected if p["src_ip"] == source_ip]
+    if not selected:
+        return {"status": "no_packets_in_direction", "kind": kind,
+                "source_ip": source_ip}
     sequence_map = defaultdict(list)
     for packet in selected:
         sequence_map[packet["sequence"]].append(packet)
@@ -170,9 +190,13 @@ def _candidate(packets: list[dict], kind: str) -> dict:
             "payload_sha256": p["payload_sha256"],
         })
         offset += p["payload_bytes"]
+    unique_hashes = {p["payload_sha256"] for p in unique}
     return {
         "status": "candidate_only", "kind": kind,
+        "source_ip": unique[0]["src_ip"],
         "ordering_rule": "ascending 16-bit sequence without wrap",
+        "unique_payload_hashes": len(unique_hashes),
+        "all_payloads_equal": len(unique_hashes) == 1,
         "sequence_start": ordered[0], "sequence_end": ordered[-1],
         "dropped_identical_sequence_frames": [
             p["frame"] for seq in ordered for p in sequence_map[seq][1:]
@@ -182,7 +206,8 @@ def _candidate(packets: list[dict], kind: str) -> dict:
         "note": (
             "Hypothetical sequence-ordered concatenation. ICMP sequence numbers are "
             "not byte offsets; sequence continuity does not establish chunking, "
-            "file transfer, completeness, or exfiltration."
+            "file transfer, completeness, or exfiltration. "
+            "Repeated identical payloads are observations, not independent chunks."
         ),
     }
 
@@ -199,12 +224,14 @@ def reconstruct_icmp_flow(
     protocol: Literal["icmpv4", "icmpv6"] | None = None,
     max_packets: int = 16,
     reconstruction_mode: Literal["none", "request", "reply"] = "none",
+    candidate_source_ip: str | None = None,
 ) -> dict:
     """Correlate one bounded Echo group; optional, explicitly hypothetical bytes."""
     if expected_sha256 is None:
         raise PacketSleuthError("expected_sha256 is required")
     ip = _validate_ip(host_ip)
     peer = _validate_ip(peer_ip)
+    source = _validate_ip(candidate_source_ip)
     if peer and not ip:
         raise PacketSleuthError("host_ip is required when peer_ip is provided")
     if identifier is not None and (type(identifier) is not int or not 0 <= identifier <= 65535):
@@ -323,7 +350,7 @@ def reconstruct_icmp_flow(
     } for p in verified]
     candidate = (
         {"status": "not_requested"} if reconstruction_mode == "none"
-        else _candidate(verified, reconstruction_mode)
+        else _candidate(verified, reconstruction_mode, source)
     )
     return finish({
         "status": "correlated_window", "group": _summarize_group(key, selected),
