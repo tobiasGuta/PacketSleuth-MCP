@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-import struct
 import subprocess
 import sys
-from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pytest

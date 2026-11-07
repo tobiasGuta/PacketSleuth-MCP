@@ -7,7 +7,6 @@ multiple records instead of conflating occurrence-first DNS A/AAAA and TTL field
 from __future__ import annotations
 
 import ipaddress
-import re
 from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
 
