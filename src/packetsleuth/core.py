@@ -317,11 +317,9 @@ class TSharkRunner:
                         pass
                 else:
                     proc.kill()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            # After SIGKILL/Terminate, use the blocking OS reap path. A
+            # timeout-based wait can itself be interrupted during cancellation.
+            proc.wait()
             for thread in started:
                 thread.join(timeout=2)
         if timed_out:

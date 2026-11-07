@@ -216,7 +216,8 @@ def query_dns(
                 code="PARSER_FAILURE",
             )
         parsed = _read_pdml_packet(detail, frame, max_records_per_message)
-        is_response = row.get("dns.flags.response") == "1"
+        flag = (row.get("dns.flags.response") or "").strip().casefold()
+        is_response = flag in ("1", "0x1", "true", "yes", "set")
         query_ref = _integer(row.get("dns.response_to"))
         response_ref = _integer(row.get("dns.response_in"))
         events.append({
