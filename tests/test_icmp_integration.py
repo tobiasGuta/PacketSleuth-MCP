@@ -85,3 +85,32 @@ def test_real_tshark_icmp_echo_ipv4_ipv6_and_empty(tmp_path):
     assert bytes.fromhex(v6["payload_hex"]) == b"V6\x00ECHO"
     assert v6["payload_offset_in_frame"] == 70
     assert v6["sequence"] == 10
+
+
+def test_real_tshark_icmp_flow_candidate_and_request_reply(tmp_path):
+    from packetsleuth.icmp_flow import reconstruct_icmp_flow
+
+    path = tmp_path / "paired.pcap"
+    request = ipv4_echo(b"PAIR")
+    # Swap the IPv4 source/destination to make a genuine Echo reply.
+    reply = bytearray(ipv4_echo(b"PAIR", echo_type=0))
+    reply[26:30], reply[30:34] = bytes(reply[30:34]), bytes(reply[26:30])
+    # Repair IPv4 header checksum after the address swap.
+    reply[24:26] = bytes(2)
+    reply[24:26] = struct.pack("!H", checksum(bytes(reply[14:34])))
+    write_pcap(path, [request, bytes(reply), ipv6_echo(b"OTHER")])
+    engine = InvestigationEngine(CaptureStore(tmp_path))
+    capture_id = engine.store.list()[0]["capture_id"]
+    pin = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    broad = reconstruct_icmp_flow(engine, capture_id, pin, scan_frames=3)
+    assert broad["status"] == "group_selection_required", broad
+    result = reconstruct_icmp_flow(
+        engine, capture_id, pin, scan_frames=3, protocol="icmpv4",
+        host_ip="192.0.2.11", peer_ip="198.51.100.12",
+        identifier=0x200, reconstruction_mode="request",
+    )
+    assert result["status"] == "correlated_window", result
+    assert result["correlation"]["pairs"][0]["payload_equal"] is True
+    assert bytes.fromhex(result["candidate"]["data_hex"]) == b"PAIR"
+    assert result["candidate"]["provenance"][0]["frame"] == 1

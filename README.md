@@ -2,7 +2,7 @@
 
 **Local-first, read-only network evidence tools for AI-assisted investigations.**
 
-PacketSleuth provides **17 MCP tools** backed by TShark. The tools help an MCP-compatible AI client inspect unknown PCAP/PCAPNG captures, query decoded fields, navigate flows, retrieve packet bytes, reconstruct bounded TCP directions, and verify evidence. The AI client decides what to investigate; the server does not hardcode attack scenarios or challenge answers.
+PacketSleuth provides **18 MCP tools** backed by TShark. The tools help an MCP-compatible AI client inspect unknown PCAP/PCAPNG captures, query decoded fields, navigate flows, retrieve packet bytes, reconstruct bounded TCP directions, and verify evidence. The AI client decides what to investigate; the server does not hardcode attack scenarios or challenge answers.
 
 > **v0.3.0 experimental release.** The forensic operations are bounded and evidence-oriented, **not** a production security sensor, an autonomous intrusion-detection system, or a native-parser sandbox. It has no built-in LLM, no automatic malware verdicts, and no network egress. The Python virtual environment does not sandbox untrusted packet parsers.
 
@@ -64,6 +64,7 @@ When the client connects, start with `healthcheck`, `list_captures`, and `inspec
 | `inspect_frames` | Verify and summarize specific frame numbers |
 | `inspect_tcp_payload` | Retrieve hex-encoded raw bytes from one TCP frame |
 | `inspect_icmp_payload` | Validate and extract bounded ICMPv4/v6 Echo data with frame/payload SHA-256 and offsets |
+| `reconstruct_icmp_flow` | Correlate bounded Echo request/reply messages with optional candidate-only concatenation |
 | `query_tcp_segments` | Page a stream's captured per-frame TCP data |
 | `follow_stream` | Bounded, potentially truncated TShark stream preview |
 | `get_detections` | Two lightweight heuristics: SYN fanout and NXDOMAIN bursts |
@@ -121,6 +122,45 @@ ambiguous nested layers, and unsupported IPv6 extension chains are rejected with
 `unsupported_layout`. There is no IP fragment reassembly or multi-packet ICMP
 flow reconstruction in this phase. Successful extraction does not establish
 exfiltration or prove that an entire session was captured.
+
+## Correlating ICMP Echo traffic
+
+Call `reconstruct_icmp_flow(capture_id, expected_sha256, start_frame, scan_frames)`
+after discovering a capture hash. The call scans at most **250 input frames**,
+lists candidate groups by IP endpoint pair / ICMP version / Echo identifier,
+and requires narrowing when more than one group matches. Use `host_ip`,
+`peer_ip`, `identifier`, `protocol`, or a narrower frame window to select
+one group. It verifies at most **24** Echo frames per call; exceeding
+`max_packets` produces an explicit `too_many_echo_packets` status rather
+than an incomplete, misleading analysis. All raw bytes remain untrusted.
+
+For a single selected group, the response lists frame/payload hashes,
+frame-relative payload offsets, request/reply comparison for unambiguous
+sequence matches, repeated-sequence warnings, and payload-hash frequencies.
+Repeated sequence numbers are **not** automatically classified as retransmissions.
+Ambiguous pairings are not silently paired.
+
+By default, `reconstruction_mode="none"` returns **no concatenated data**.
+Opt in to `reconstruction_mode="request"` or `"reply"` to receive a
+**candidate-only** hex concatenation, in ascending sequence order, limited to
+8,192 bytes. If Echo messages of the selected kind originate from both ends of
+the endpoint pair, the tool returns `source_direction_required` rather than
+silently combining them. Pass `candidate_source_ip` to select one sender;
+this option does not remove packets from the correlation summary. Candidate
+metadata also reports whether all included payloads are identical, since repeated
+data does not establish independent chunks. The tool refuses to concatenate
+across missing sequences,
+conflicting duplicate sequences, truncated packet payloads, or ambiguous
+16-bit sequence wrap. Identical duplicates with the same kind/sequence are
+deduplicated and explicitly reported. Sequence numbers are **message IDs**,
+not byte offsets; a candidate blob is not evidence of real application-layer
+chunking or exfiltration. No Base64 decoding, decompression, or fragment
+reassembly is performed.
+
+The operation currently verifies each selected Echo frame through the existing
+pinned single-frame extractor, so prefer narrow windows and modest packet counts
+for predictable runtime. Neither grouping nor a successful candidate sequence
+proves capture completeness or session boundaries.
 
 ## Threat model and limitations
 
