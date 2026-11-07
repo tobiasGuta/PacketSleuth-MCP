@@ -8,7 +8,7 @@ from typing import Literal
 
 from mcp.server import MCPServer
 
-from packetsleuth import forensics
+from packetsleuth import forensics, icmp
 from packetsleuth.core import CaptureStore, InvestigationEngine
 
 capture_root = Path(os.environ.get("PACKETSLEUTH_CAPTURE_DIR", "./captures"))
@@ -76,6 +76,14 @@ def inspect_frames(capture_id: str, frames: list[int]) -> dict:
 def inspect_tcp_payload(capture_id: str, frame: int, max_bytes: int = 2048) -> dict:
     """Retrieve exact raw TCP payload bytes (hex) from a single numbered packet."""
     return engine.inspect_tcp_payload(capture_id, frame, max_bytes)
+
+
+@mcp.tool()
+def inspect_icmp_payload(
+    capture_id: str, frame: int, expected_sha256: str, max_bytes: int = 1024,
+) -> dict:
+    """Verify and extract bounded ICMPv4/v6 Echo data from one captured frame."""
+    return icmp.inspect_icmp_payload(engine, capture_id, frame, expected_sha256, max_bytes)
 
 
 @mcp.tool()

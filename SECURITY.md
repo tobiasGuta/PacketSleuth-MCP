@@ -12,7 +12,7 @@ PacketSleuth is experimental forensic software. It is **not** certified secure f
 
 ## Bounded operations
 
-MCP tools execute predetermined TShark commands without a shell or arbitrary display filters. Inputs are validated. New v0.3 tools run on bounded frame windows and compare the capture SHA-256 before/after processing; these protections do not prevent all native parser exploits, filesystem races, resource exhaustion or prompt injection. TCP reconstruction reports missing ranges, overlap conflicts, and scope limitations; it cannot prove that a full connection or application object was captured.
+MCP tools execute predetermined TShark commands without a shell or arbitrary display filters. Inputs are validated. New v0.3 tools run on bounded frame windows and compare the capture SHA-256 before/after processing; these protections do not prevent all native parser exploits, filesystem races, resource exhaustion or prompt injection. ICMP Echo extraction rejects fragmented, truncated, or ambiguous layouts; its raw payload bytes and hashes are evidence, not proof of tunneling or exfiltration. TCP reconstruction reports missing ranges, overlap conflicts, and scope limitations; it cannot prove that a full connection or application object was captured.
 
 The service does not offer live interface capture, unrestricted code execution, arbitrary file export, external threat intelligence requests, or automatic data exfiltration. The MCP client itself may offer independent tools; audit those separately.
 

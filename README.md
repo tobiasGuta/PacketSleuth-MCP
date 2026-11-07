@@ -2,7 +2,7 @@
 
 **Local-first, read-only network evidence tools for AI-assisted investigations.**
 
-PacketSleuth provides **16 MCP tools** backed by TShark. The tools help an MCP-compatible AI client inspect unknown PCAP/PCAPNG captures, query decoded fields, navigate flows, retrieve packet bytes, reconstruct bounded TCP directions, and verify evidence. The AI client decides what to investigate; the server does not hardcode attack scenarios or challenge answers.
+PacketSleuth provides **17 MCP tools** backed by TShark. The tools help an MCP-compatible AI client inspect unknown PCAP/PCAPNG captures, query decoded fields, navigate flows, retrieve packet bytes, reconstruct bounded TCP directions, and verify evidence. The AI client decides what to investigate; the server does not hardcode attack scenarios or challenge answers.
 
 > **v0.3.0 experimental release.** The forensic operations are bounded and evidence-oriented, **not** a production security sensor, an autonomous intrusion-detection system, or a native-parser sandbox. It has no built-in LLM, no automatic malware verdicts, and no network egress. The Python virtual environment does not sandbox untrusted packet parsers.
 
@@ -63,6 +63,7 @@ When the client connects, start with `healthcheck`, `list_captures`, and `inspec
 | `query_events` | Page DNS/HTTP/TLS summaries in bounded windows |
 | `inspect_frames` | Verify and summarize specific frame numbers |
 | `inspect_tcp_payload` | Retrieve hex-encoded raw bytes from one TCP frame |
+| `inspect_icmp_payload` | Validate and extract bounded ICMPv4/v6 Echo data with frame/payload SHA-256 and offsets |
 | `query_tcp_segments` | Page a stream's captured per-frame TCP data |
 | `follow_stream` | Bounded, potentially truncated TShark stream preview |
 | `get_detections` | Two lightweight heuristics: SYN fanout and NXDOMAIN bursts |
@@ -97,6 +98,29 @@ Older `query_flows`/`query_events` tools use `next_offset` **within a frame wind
 5. Use `identify_stream_content` at an offset of interest to identify candidate signatures without exposing payload bytes. Use `verify_stream_range` with the returned `returned_range_sha256` and matching query parameters to independently recompute the byte-range hash.
 
 Per-request limits: at most **500 frames**, **256 matching segments**, **512 KiB TCP sequence span**, and **8,192 bytes of raw data** per response. Narrow frame windows when needed. The server handles out-of-order data, duplicates, and 32-bit sequence wrap within a bounded window; the first captured segment may not be the beginning of a session. It does **not** claim complete capture-level or application-layer reassembly, decode TLS plaintext, parse every binary protocol, infer malicious intent from signatures, or recover artifacts onto disk. Partial captures, TCP sequence ambiguities, IP fragmentation, overlaps, and TShark parsing may affect results.
+
+## ICMPv4 / ICMPv6 Echo payload extraction
+
+Use `inspect_capture` to obtain the capture SHA-256, then call
+`inspect_icmp_payload(capture_id, frame, expected_sha256, max_bytes=1024)`.
+This operation **requires** the full capture SHA-256. It extracts Echo request/reply
+data without interpreting it as commands, Base64, compressed content, or a decoded
+application message. It supports ICMPv4 types 0/8 and ICMPv6 types 128/129,
+with a 4,096-byte maximum returned preview.
+
+The tool validates raw TShark layer offsets against the complete captured frame,
+IPv4 total length or IPv6 payload length, and the 8-byte ICMP Echo header.
+It excludes link-layer padding and returns the frame-relative byte offsets,
+complete-payload hash, returned-prefix hash, frame hash, identifier, sequence,
+direction, and printable ASCII (`.` for non-ASCII bytes). Offsets are relative
+to the **captured frame**, not offsets into the PCAP file. `frame_file_offset`
+is a separate capture-record location when TShark provides one.
+
+To avoid false evidence, fragmented datagrams, truncated captures, jumbograms,
+ambiguous nested layers, and unsupported IPv6 extension chains are rejected with
+`unsupported_layout`. There is no IP fragment reassembly or multi-packet ICMP
+flow reconstruction in this phase. Successful extraction does not establish
+exfiltration or prove that an entire session was captured.
 
 ## Threat model and limitations
 

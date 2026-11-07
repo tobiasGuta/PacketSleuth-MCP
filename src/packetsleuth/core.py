@@ -11,6 +11,7 @@ import csv
 import hashlib
 import io
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -290,6 +291,20 @@ class TSharkRunner:
         raw = self._run(args)
         reader = csv.reader(io.StringIO(raw), delimiter="\t", quotechar='"')
         return [dict(zip(fields, row)) for row in reader if len(row) == len(fields)]
+
+    def raw_frame(self, path: Path, frame: int) -> dict | None:
+        """Read one bounded TShark jsonraw packet, including raw-layer byte offsets."""
+        raw = self._run([
+            "-n", "-r", str(path), "-c", str(frame),
+            "-Y", f"frame.number == {frame}", "-T", "jsonraw",
+        ])
+        try:
+            packets = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise PacketSleuthError("TShark returned malformed raw-frame JSON") from exc
+        if not isinstance(packets, list) or len(packets) > 1:
+            raise PacketSleuthError("TShark returned an unexpected raw-frame result")
+        return packets[0] if packets else None
 
     def follow_tcp(self, path: Path, stream_id: int, limit_bytes: int) -> dict:
         # Limit the *returned preview*, not the success of a large stream.
