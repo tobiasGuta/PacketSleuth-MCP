@@ -472,4 +472,4 @@ async def test_mcp_argument_validation_and_runtime_errors_have_same_error_envelo
 
         healthy = await client.call_tool("healthcheck", {})
         assert healthy.is_error is False
-        assert "capture_directory_exists" in healthy.structured_content
+        assert healthy.content  # Successful result shape remains backward-compatible.

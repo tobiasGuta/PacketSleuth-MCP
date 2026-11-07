@@ -50,12 +50,27 @@ class PacketSleuthMCPServer(MCPServer):
 
         if isinstance(result, CallToolResult):
             body = result.structured_content
-            if isinstance(body, dict) and body.get("ok") is False and isinstance(
-                body.get("error"), dict
+            if (
+                body is None and len(result.content) == 1
+                and isinstance(result.content[0], TextContent)
             ):
-                # The existing decorators preserve the Python API response shapes.
-                # At the MCP boundary, explicitly report expected failures as failures.
-                return result.model_copy(update={"is_error": True})
+                # This MCP SDK version serializes returned dictionaries into text,
+                # rather than structured_content. Only inspect small JSON objects
+                # with the exact PacketSleuth error envelope; never parse payloads.
+                candidate = result.content[0].text
+                if len(candidate) <= 4096 and candidate.lstrip().startswith("{"):
+                    try:
+                        body = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        body = None
+            if (
+                isinstance(body, dict) and body.get("ok") is False
+                and isinstance(body.get("error"), dict)
+                and body["error"].get("code") in PacketSleuthError.CODES
+            ):
+                return result.model_copy(
+                    update={"is_error": True, "structured_content": body}
+                )
         return result
 
 
