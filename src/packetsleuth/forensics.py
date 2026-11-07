@@ -37,7 +37,9 @@ QUERY_FIELDS = frozenset({
     "dns.qry.name", "dns.flags.rcode", "dns.qry.type", "http.host",
     "http.request.method", "http.request.uri", "http.response.code",
     "tls.handshake.extensions_server_name", "tls.record.content_type",
-    "icmp.type", "arp.opcode", "ftp.request.command", "smtp.req.command",
+    "icmp.type", "icmp.code", "icmp.ident", "icmp.seq",
+    "icmpv6.type", "icmpv6.code", "icmpv6.echo.identifier",
+    "icmpv6.echo.sequence_number", "arp.opcode", "ftp.request.command", "smtp.req.command",
 })
 DEFAULT_FIELDS = (
     "frame.number", "frame.time_epoch", "frame.len", "frame.protocols",
