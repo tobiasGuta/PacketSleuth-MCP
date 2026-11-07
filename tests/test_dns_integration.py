@@ -94,3 +94,15 @@ def test_real_dns_multianswer_ttl_and_cursor(tmp_path):
         "192.0.2.10", "192.0.2.11", "2001:db8::10",
     ]
     assert second["sha256"] == pin
+
+
+def test_malformed_capture_reports_parser_failure(tmp_path):
+    from packetsleuth.core import PacketSleuthError, TSharkRunner
+
+    path = tmp_path / "malformed.pcap"
+    # Valid file magic but deliberately incomplete global header.
+    path.write_bytes(bytes.fromhex("d4c3b2a1") + bytes(8))
+    runner = TSharkRunner()
+    with pytest.raises(PacketSleuthError) as exc:
+        runner.query(path, fields=("frame.number",), scan_limit=2)
+    assert exc.value.code == "PARSER_FAILURE"

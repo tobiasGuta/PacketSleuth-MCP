@@ -25,6 +25,7 @@ def make_capture(tmp_path):
 
 class FrameRunner:
     def __init__(self):
+        self.calls = []
         self.rows = [{
             "frame.number": str(i),
             "frame.time_epoch": str(i),
@@ -38,6 +39,7 @@ class FrameRunner:
         } for i in range(1, 9)]
 
     def query(self, path, fields=(), display_filter=None, scan_limit=10000):
+        self.calls.append({"scan_limit": scan_limit, "display_filter": display_filter})
         selected = []
         for row in self.rows:
             frame = int(row["frame.number"])
@@ -232,3 +234,49 @@ def test_error_envelope_and_config_limits(tmp_path, monkeypatch):
     monkeypatch.setenv("PACKETSLEUTH_TSHARK_TIMEOUT_SECONDS", "invalid")
     with pytest.raises(PacketSleuthError):
         TSharkRunner(sys.executable)
+
+
+def test_summary_and_detection_respect_configured_scan_ceiling(tmp_path, monkeypatch):
+    store, _ = make_capture(tmp_path)
+    runner = FrameRunner()
+    engine = InvestigationEngine(store, runner)
+    capture = store.list()[0]["capture_id"]
+    monkeypatch.setenv("PACKETSLEUTH_MAX_SCAN_FRAMES", "4")
+    summary = engine.inspect_capture(capture)
+    assert summary["observed_packets"] == 4
+    assert summary["coverage"]["scan_limit_frames"] == 4
+    assert summary["coverage"]["complete_capture_scan"] is False
+    assert runner.calls[-1]["scan_limit"] == 4
+    engine.get_detections(capture)
+    assert runner.calls[-1]["scan_limit"] == 4
+
+
+def test_clipped_dns_and_packet_values_are_explicit(tmp_path):
+    store, pin = make_capture(tmp_path)
+    runner = FrameRunner()
+    runner.rows[0]["dns.qry.name"] = "q" * 500
+    engine = InvestigationEngine(store, runner)
+    capture = store.list()[0]["capture_id"]
+    packets = query_packets(
+        engine, capture, fields=["frame.number", "dns.qry.name"],
+        limit=2, scan_frames=8, expected_sha256=pin,
+    )
+    assert packets["truncation"]["field_values_truncated"] is True
+    assert packets["records"][0]["truncated_fields"] == ["dns.qry.name"]
+    events = engine.query_events(capture, "dns", limit=2, scan_frames=8)
+    assert events["truncation"]["field_values_truncated"] is True
+    assert events["events"][0]["truncated_fields"] == ["dns.qry.name"]
+
+
+def test_long_dns_rdata_has_explicit_truncation_flag():
+    xml = ('<packet><proto name="dns"><field name="dns.count.answers" show="1"/>'
+           '<field name="Answers"><field name="" showname="RR">'
+           '<field name="dns.resp.name" show="long.example"/>'
+           '<field name="dns.resp.type" show="16"/>'
+           '<field name="dns.resp.ttl" show="300"/>'
+           '<field name="dns.txt" show="' + "T" * 400 + '"/>'
+           '</field></field></proto></packet>')
+    record = _read_pdml_packet(ET.fromstring(xml), 1, 5)["answer_records"][0]
+    assert record["record_type"] == "TXT"
+    assert record["rdata_truncated"] is True
+    assert len(record["rdata"]["dns.txt"][0]) == 256
