@@ -10,8 +10,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import json
 import ipaddress
+import json
 import os
 import re
 import shutil
