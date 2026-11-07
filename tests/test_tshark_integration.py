@@ -78,3 +78,33 @@ def test_pcap_tcp_payload_and_stream_parsing(tmp_path):
     assert preview["output_truncated"] is False
 
     assert engine.verify_evidence(capture, [1, 2])["references_verified"]
+
+
+def test_generic_query_and_out_of_order_reconstruction(tmp_path):
+    """No CTF fixture: recover deliberately out-of-order generic TCP bytes."""
+    from packetsleuth.forensics import query_packets, reconstruct_tcp, identify_stream_content
+
+    path = tmp_path / "reorder.pcap"
+    frames = [
+        tcp_frame(100, 0x02, b""),
+        tcp_frame(106, 0x18, b"1.7\n"),
+        tcp_frame(101, 0x18, b"%PDF-"),
+    ]
+    with path.open("wb") as fh:
+        fh.write(bytes.fromhex("d4c3b2a1") + struct.pack("<HHIIII", 2, 4, 0, 0, 65535, 1))
+        for index, frame in enumerate(frames):
+            fh.write(struct.pack("<IIII", 1700001000 + index, 0, len(frame), len(frame)))
+            fh.write(frame)
+
+    engine = InvestigationEngine(CaptureStore(tmp_path))
+    capture = engine.store.list()[0]["capture_id"]
+    generic = query_packets(engine, capture, ["frame.number", "tcp.len"],
+                            match_field="tcp.stream", match_value="0",
+                            match_mode="exact")
+    assert len(generic["records"]) == 3
+    stream = reconstruct_tcp(engine, capture, 0, source_ip="192.0.2.15",
+                             start_frame=1, scan_frames=10)
+    assert bytes.fromhex(stream["data_hex"]) == b"%PDF-1.7\n"
+    assert stream["complete_sequence_span"]
+    signature = identify_stream_content(engine, capture, 0, source_ip="192.0.2.15")
+    assert signature["content_hint"]["format"] == "PDF document"

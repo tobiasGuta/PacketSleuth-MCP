@@ -9,6 +9,11 @@ from typing import Literal
 from mcp.server import MCPServer
 
 from packetsleuth.core import CaptureStore, InvestigationEngine
+from packetsleuth.forensics import (
+    QUERY_FIELDS, identify_stream_content as _identify_stream_content,
+    query_packets as _query_packets, reconstruct_tcp as _reconstruct_tcp,
+    verify_stream_range as _verify_stream_range,
+)
 
 capture_root = Path(os.environ.get("PACKETSLEUTH_CAPTURE_DIR", "./captures"))
 engine = InvestigationEngine(CaptureStore(capture_root))
@@ -107,6 +112,71 @@ def verify_evidence(
 ) -> dict:
     """Verify listed frame numbers exist and optionally match a capture SHA-256."""
     return engine.verify_evidence(capture_id, frames, expected_sha256)
+
+
+@mcp.tool()
+def list_query_fields() -> dict:
+    """List safe decoded packet fields supported by protocol-neutral searches."""
+    return {"fields": sorted(QUERY_FIELDS), "note": "No caller-defined TShark expressions."}
+
+
+@mcp.tool()
+def query_packets(
+    capture_id: str, fields: list[str] | None = None,
+    match_field: str | None = None, match_value: str | None = None,
+    match_mode: Literal["exact", "contains"] = "contains",
+    host_ip: str | None = None, start_frame: int = 1,
+    scan_frames: int = 250, limit: int = 25,
+    expected_sha256: str | None = None,
+) -> dict:
+    """Search safe decoded fields; resume with next_start_frame for bounded result pages."""
+    return _query_packets(
+        engine, capture_id, fields, match_field, match_value, match_mode,
+        host_ip, start_frame, scan_frames, limit, expected_sha256,
+    )
+
+
+@mcp.tool()
+def reconstruct_tcp(
+    capture_id: str, stream_id: int, source_ip: str | None = None,
+    source_port: int | None = None, start_frame: int = 1,
+    scan_frames: int = 250, byte_offset: int = 0, max_bytes: int = 2048,
+    expected_sha256: str | None = None,
+) -> dict:
+    """Reassemble bounded one-direction TCP bytes; report gaps, overlaps, frame provenance."""
+    return _reconstruct_tcp(
+        engine, capture_id, stream_id, source_ip, source_port, start_frame,
+        scan_frames, byte_offset, max_bytes, expected_sha256,
+    )
+
+
+@mcp.tool()
+def identify_stream_content(
+    capture_id: str, stream_id: int, source_ip: str | None = None,
+    source_port: int | None = None, start_frame: int = 1,
+    scan_frames: int = 250, byte_offset: int = 0,
+    expected_sha256: str | None = None,
+) -> dict:
+    """Recognize generic file/protocol signatures at a reassembled stream byte offset."""
+    return _identify_stream_content(
+        engine, capture_id, stream_id, source_ip, source_port,
+        start_frame, scan_frames, byte_offset, expected_sha256,
+    )
+
+
+@mcp.tool()
+def verify_stream_range(
+    capture_id: str, stream_id: int, expected_range_sha256: str,
+    source_ip: str | None = None, source_port: int | None = None,
+    start_frame: int = 1, scan_frames: int = 250, byte_offset: int = 0,
+    max_bytes: int = 2048, expected_sha256: str | None = None,
+) -> dict:
+    """Recompute hash of a selected TCP byte range against capture evidence."""
+    return _verify_stream_range(
+        engine, capture_id, stream_id, expected_range_sha256, source_ip,
+        source_port, start_frame, scan_frames, byte_offset, max_bytes,
+        expected_sha256,
+    )
 
 
 def main() -> None:
