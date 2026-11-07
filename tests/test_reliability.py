@@ -444,6 +444,7 @@ def anyio_backend():
 @pytest.mark.anyio
 async def test_mcp_argument_validation_and_runtime_errors_have_same_error_envelope():
     from mcp import Client
+
     from packetsleuth.server import mcp
 
     async with Client(mcp, raise_exceptions=True) as client:
