@@ -161,7 +161,9 @@ def _decode_payload(hex_value: str, max_bytes: int) -> dict:
     """Return raw hex and a printable display preview; do not interpret as commands."""
     cleaned = hex_value.replace(":", "").strip()
     if not cleaned or len(cleaned) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", cleaned):
-        raise PacketSleuthError("TShark returned invalid TCP payload encoding")
+        raise PacketSleuthError(
+            "TShark returned invalid TCP payload encoding", code="PARSER_FAILURE"
+        )
     raw = bytes.fromhex(cleaned)
     prefix = raw[:max_bytes]
     return {

@@ -280,3 +280,20 @@ def test_long_dns_rdata_has_explicit_truncation_flag():
     assert record["record_type"] == "TXT"
     assert record["rdata_truncated"] is True
     assert len(record["rdata"]["dns.txt"][0]) == 256
+
+
+def test_parser_fault_codes_do_not_look_like_bad_analyst_input():
+    from packetsleuth.core import _decode_payload
+    from packetsleuth.forensics import _decode_tcp_row
+
+    with pytest.raises(PacketSleuthError) as exc:
+        _decode_payload("not_hex", 16)
+    assert exc.value.code == "PARSER_FAILURE"
+
+    with pytest.raises(PacketSleuthError) as exc:
+        _decode_tcp_row({"frame.number": "1", "tcp.seq": "2", "tcp.payload": "zz"})
+    assert exc.value.code == "PARSER_FAILURE"
+
+    with pytest.raises(PacketSleuthError) as exc:
+        _decode_tcp_row({"frame.number": "1", "tcp.seq": ""})
+    assert exc.value.code == "PARSER_FAILURE"

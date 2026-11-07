@@ -114,9 +114,13 @@ def query_packets(
     if not isinstance(fields, list) or not 1 <= len(fields) <= MAX_QUERY_FIELDS:
         raise PacketSleuthError(f"Provide 1 to {MAX_QUERY_FIELDS} fields")
     if any(not isinstance(field, str) or field not in QUERY_FIELDS for field in fields):
-        raise PacketSleuthError("Unsupported query field; see list_query_fields")
+        raise PacketSleuthError(
+            "Unsupported query field; see list_query_fields", code="UNSUPPORTED_OPERATION"
+        )
     if match_field is not None and match_field not in QUERY_FIELDS:
-        raise PacketSleuthError("Unsupported match_field; see list_query_fields")
+        raise PacketSleuthError(
+            "Unsupported match_field; see list_query_fields", code="UNSUPPORTED_OPERATION"
+        )
     if (match_field is None) != (match_value is None):
         raise PacketSleuthError("match_field and match_value must be supplied together")
     if match_value is not None and (not isinstance(match_value, str) or len(match_value) > 128
@@ -200,14 +204,19 @@ def _decode_tcp_row(row: dict) -> dict | None:
     frame = int(row.get("frame.number") or 0)
     seq = row.get("tcp.seq_raw") or row.get("tcp.seq")
     if not frame or not seq or not seq.isdecimal():
-        return None
+        raise PacketSleuthError(
+            "TShark returned a TCP segment without a valid frame or sequence",
+            code="PARSER_FAILURE",
+        )
     field = row.get("tcp.payload") or ""
     if not field:
         data = b""
     else:
         field = field.replace(":", "")
         if len(field) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", field):
-            raise PacketSleuthError("Malformed TShark TCP payload encoding")
+            raise PacketSleuthError(
+                "Malformed TShark TCP payload encoding", code="PARSER_FAILURE"
+            )
         data = bytes.fromhex(field)
     return {
         "frame": frame, "seq": int(seq), "data": data,
@@ -297,7 +306,9 @@ def reconstruct_tcp(
                                scan_limit=end_frame)
     segments = [item for row in rows if (item := _decode_tcp_row(row)) is not None]
     if len(segments) > MAX_TCP_SEGMENTS:
-        raise PacketSleuthError("Too many TCP segments in window; narrow scan_frames")
+        raise PacketSleuthError(
+            "Too many TCP segments in window; narrow scan_frames", code="OUTPUT_LIMIT"
+        )
     directions = Counter(item["key"] for item in segments)
     candidates = [
         {"src_ip": key[0], "src_port": key[1], "dst_ip": key[2],
@@ -324,7 +335,10 @@ def reconstruct_tcp(
         return base | {"status": "no_payload_in_window", "available_bytes": 0,
                        "note": "No TCP payload in this frame window/direction."}
     if len({item["seq_source"] for item in selected}) > 1:
-        raise PacketSleuthError("Inconsistent TCP sequence fields; cannot reconstruct safely")
+        raise PacketSleuthError(
+            "Inconsistent TCP sequence fields; cannot reconstruct safely",
+            code="PARSER_FAILURE",
+        )
     # Direction-specific raw TCP sequence numbers, unwrapped around the first
     # captured segment. Works across 32-bit rollover for windows shorter than 2 GiB.
     anchor = selected[0]["seq"]
@@ -335,7 +349,10 @@ def reconstruct_tcp(
     span = max(pos + max(len(item["data"]), item["reported_length"])
                for pos, item in zip(positions, selected))
     if span > MAX_TCP_BYTES:
-        raise PacketSleuthError("TCP sequence span exceeds 512 KiB; narrow the frame window")
+        raise PacketSleuthError(
+            "TCP sequence span exceeds 512 KiB; narrow the frame window",
+            code="OUTPUT_LIMIT",
+        )
     payload = bytearray(span)
     observed = bytearray(span)
     conflict_frames = []

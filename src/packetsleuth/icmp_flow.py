@@ -180,7 +180,9 @@ def _candidate(
                 "max_bytes": MAX_CANDIDATE_BYTES}
     data = b"".join(bytes.fromhex(p["data_hex"]) for p in unique)
     if len(data) != length:
-        raise PacketSleuthError("Candidate length differs from captured bytes")
+        raise PacketSleuthError(
+            "Candidate length differs from captured bytes", code="PARSER_FAILURE"
+        )
     offset = 0
     contributions = []
     for p in unique:
