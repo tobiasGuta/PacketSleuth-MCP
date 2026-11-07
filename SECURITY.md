@@ -14,7 +14,12 @@ PacketSleuth is experimental forensic software. It is **not** certified secure f
 
 MCP expected errors use explicit `ok=false` envelopes with stable error codes.
 Parser failures, timeouts and exceeded output limits do not masquerade as empty
-successful pages. Frame cursors are tied to the capture SHA-256 and exact filter
+successful pages. MCP input-schema failures are normalized to `isError=true`
+results containing the same structured `INVALID_INPUT` envelope as runtime
+validation errors. New page cursors have HMAC integrity per server process and
+are invalidated on service restart; numeric legacy offsets remain supported.
+Duplicate or malformed frame identities produce parser errors instead of being
+silently discarded. Frame cursors are tied to the capture SHA-256 and exact filter
 scope; they cannot certify full-capture coverage. Subprocess groups are killed
 and reaped on timeout or cancellation, but deployment still requires OS-level
 CPU, memory, disk, and privilege restrictions. Bounded capture, scan, output and

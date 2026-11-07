@@ -107,7 +107,7 @@ def query_packets(
     The matching operation happens in Python on a fixed set of decoded fields,
     avoiding user-supplied display-filter expressions and injection issues.
     """
-    from packetsleuth.pagination import decode_cursor, encode_cursor
+    from packetsleuth.pagination import decode_cursor, encode_cursor, stable_frame_rows
 
     if fields is None:
         fields = list(DEFAULT_FIELDS)
@@ -144,8 +144,12 @@ def query_packets(
     position = decode_cursor(cursor, digest, scope, start_frame, end_frame)
     if position != start_frame:
         frame_filter = f"frame.number >= {position} && frame.number <= {end_frame}"
-    rows = engine.runner.query(path, fields=requested, display_filter=frame_filter,
-                               scan_limit=end_frame)
+    rows = stable_frame_rows(
+        engine.runner.query(
+            path, fields=requested, display_filter=frame_filter,
+            scan_limit=end_frame,
+        )
+    )
     matches = []
     for row in rows:
         if ip and ip not in (row.get("ip.src"), row.get("ip.dst"), row.get("ipv6.src"),
