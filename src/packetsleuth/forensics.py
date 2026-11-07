@@ -153,8 +153,12 @@ def query_packets(
                 continue
             if match_mode == "contains" and match_value.casefold() not in value.casefold():
                 continue
-        matches.append({field: _clip(row.get(field, ""), 256) for field in fields}
-                       | {"frame": int(row["frame.number"])})
+        record = {field: _clip(row.get(field, ""), 256) for field in fields}
+        truncated = [field for field in fields if len(row.get(field, "")) > 256]
+        if truncated:
+            record["truncated_fields"] = truncated
+        record["frame"] = int(row["frame.number"])
+        matches.append(record)
     _assert_unchanged(path, digest)
     has_more = len(matches) > limit
     next_frame = (
@@ -170,6 +174,7 @@ def query_packets(
         "scan_range": {"start_frame": position, "end_frame": end_frame},
         "truncation": {
             "page_truncated": has_more, "output_truncated": False,
+            "field_values_truncated": any("truncated_fields" in r for r in matches[:limit]),
             "window_may_have_more_frames": True,
         },
         "coverage": coverage,

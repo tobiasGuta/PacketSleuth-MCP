@@ -91,17 +91,20 @@ def _parse_records(dns: ET.Element, max_records: int) -> tuple[list[dict], dict]
     expected_answers = _integer(_first(dns, "dns.count.answers"))
     records = []
     nodes = _record_nodes(dns)
-    for node in nodes[:max_records]:
+    answer_total = expected_answers if expected_answers is not None else len(nodes)
+    for node in nodes[:min(answer_total, max_records)]:
         name = _first(node, "dns.resp.name")
         number = _integer(_first(node, "dns.resp.type"))
         ttl = _integer(_first(node, "dns.resp.ttl"))
         if name is None or number is None:
             continue
         data = {}
+        rdata_truncated = False
         for key in RDATA_FIELDS:
             values = _field_values(node, key)
             if values:
                 data[key] = [_clip(v, 256) for v in values[:8]]
+                rdata_truncated |= len(values) > 8 or any(len(v) > 256 for v in values)
         ips = []
         for field in ("dns.a", "dns.aaaa"):
             for value in data.get(field, ()):
@@ -113,20 +116,19 @@ def _parse_records(dns: ET.Element, max_records: int) -> tuple[list[dict], dict]
             "name": _clip(name, 255), "type_code": number,
             "record_type": TYPE_NAMES.get(number, f"TYPE{number}"),
             "ttl": ttl, "rdata": data, "answer_ips": ips,
-            "rdata_decoded": bool(data),
+            "rdata_decoded": bool(data), "rdata_truncated": rdata_truncated,
         })
     # DNS header separates answer, authority, and additional sections by count.
     # If record owners could not be located, do not manufacture missing RRs.
-    answer_count = expected_answers if expected_answers is not None else len(records)
-    answer_records = records[:answer_count]
+    answer_records = records
+    missing = expected_answers is not None and expected_answers > len(answer_records)
     return answer_records, {
         "expected_answer_count": expected_answers,
         "parsed_answer_count": len(answer_records),
-        "answers_truncated": len(nodes) > max_records
-        or (expected_answers is not None and expected_answers > len(answer_records)),
+        "answers_truncated": missing or answer_total > max_records,
         "record_parse_complete": (
-            expected_answers is not None and len(answer_records) == expected_answers
-            and len(nodes) <= max_records
+            expected_answers is not None and not missing
+            and all(record["ttl"] is not None for record in answer_records)
         ),
         "records_in_packet_with_owner_name": len(nodes),
     }
@@ -250,6 +252,9 @@ def query_dns(
         "truncation": {
             **meta["truncation"],
             "any_answer_records_truncated": any(e["answers_truncated"] for e in events),
+            "any_rdata_truncated": any(
+                r["rdata_truncated"] for e in events for r in e["answer_records"]
+            ),
         },
         "note": (
             "DNS response references are TShark's dissection links, not proof "

@@ -264,11 +264,17 @@ class TSharkRunner:
     ) -> str | tuple[str, bool]:
         """Bound stdout/stderr, kill the whole process group, and reap on cancellation."""
         max_bytes = min(max_bytes, self.max_output_bytes)
-        proc = subprocess.Popen(
-            [self.executable, *args],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=(os.name == "posix"),
-        )
+        try:
+            proc = subprocess.Popen(
+                [self.executable, *args],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=(os.name == "posix"),
+            )
+        except OSError as exc:
+            raise PacketSleuthError(
+                f"TShark process could not start: {_clip(str(exc))}",
+                code="UNSUPPORTED_OPERATION",
+            ) from exc
         stdout = bytearray()
         stderr = bytearray()
         exceeded = threading.Event()
@@ -472,6 +478,8 @@ def _summarize_row(row: dict[str, str]) -> dict:
                  "http.request.uri", "tls.handshake.extensions_server_name", "tcp.stream"):
         if row.get(name):
             result[name] = _clip(row[name])
+            if len(row[name]) > 300:
+                result.setdefault("truncated_fields", []).append(name)
     return result
 
 
@@ -514,7 +522,10 @@ class InvestigationEngine:
 
     def inspect_capture(self, capture_id: str) -> dict:
         path, digest = self._capture(capture_id)
-        rows = self.runner.query(path)
+        scan_limit = _setting(
+            "PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES
+        )
+        rows = self.runner.query(path, scan_limit=scan_limit)
         sources = Counter((r.get("ip.src") or r.get("ipv6.src")) for r in rows)
         protocols = Counter((r.get("frame.protocols") or "unknown").split(":")[-1] for r in rows)
         count = len(rows)
@@ -533,14 +544,17 @@ class InvestigationEngine:
 
     @staticmethod
     def _coverage(count: int, filtered: bool) -> dict:
+        scan_limit = _setting(
+            "PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES
+        )
         return {
-            "scan_limit_frames": MAX_SCAN_FRAMES,
-            "complete_capture_scan": not filtered and count < MAX_SCAN_FRAMES,
+            "scan_limit_frames": scan_limit,
+            "complete_capture_scan": not filtered and count < scan_limit,
             "note": (
                 "Filtered results may exclude later capture frames; results are not exhaustive."
                 if filtered else
                 "At the configured frame limit, completeness is unknown."
-                if count >= MAX_SCAN_FRAMES else "All frames were scanned."
+                if count >= scan_limit else "All frames were scanned."
             ),
         }
 
@@ -594,6 +608,8 @@ class InvestigationEngine:
             flow["bytes"] += int(r.get("frame.len") or 0)
             if len(flow["sample_frames"]) < 8:
                 flow["sample_frames"].append(int(r.get("frame.number") or 0))
+        for flow in flows.values():
+            flow["sample_frames_truncated"] = flow["packets"] > len(flow["sample_frames"])
         output = sorted(flows.values(), key=lambda item: item["bytes"], reverse=True)
         scope = {
             "tool": "query_flows", "capture_id": capture_id,
@@ -656,15 +672,19 @@ class InvestigationEngine:
         if cursor is None:
             position = offset
         selected, meta = page(rows, limit, position, digest, scope, start_frame, end_frame)
+        events = [_summarize_row(r) for r in selected]
         return {
             "capture_id": capture_id, "sha256": digest,
             "protocol": protocol, "host_ip": ip,
-            "events": [_summarize_row(r) for r in selected],
+            "events": events,
             "observed_matches_in_scan": len(rows),
             "results_truncated": meta["results_truncated"],
             "next_offset": meta["next_offset"],
             "has_more": meta["has_more"], "next_cursor": meta["next_cursor"],
-            "scan_range": meta["scan_range"], "truncation": meta["truncation"],
+            "scan_range": meta["scan_range"],
+            "truncation": meta["truncation"] | {
+                "field_values_truncated": any("truncated_fields" in event for event in events),
+            },
             "coverage": coverage,
             "untrusted_data": True,
             "note": (
@@ -817,7 +837,10 @@ class InvestigationEngine:
     def get_detections(self, capture_id: str) -> dict:
         """Conservative heuristics; findings are leads, never compromise verdicts."""
         path, digest = self._capture(capture_id)
-        rows = self.runner.query(path)
+        scan_limit = _setting(
+            "PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES
+        )
+        rows = self.runner.query(path, scan_limit=scan_limit)
         scan_ports: dict[str, set[tuple[str, str]]] = defaultdict(set)
         scan_frames: dict[str, list[int]] = defaultdict(list)
         nxdomain_frames: dict[str, list[int]] = defaultdict(list)
