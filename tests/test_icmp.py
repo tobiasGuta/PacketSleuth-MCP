@@ -13,14 +13,14 @@ from packetsleuth.core import CaptureStore, InvestigationEngine, PacketSleuthErr
 from packetsleuth.icmp import inspect_icmp_payload
 
 
-def packet_v4(payload=b"ABC\\x00XYZ", *, fragment=0, icmp_type=8):
+def packet_v4(payload=b"ABC\x00XYZ", *, fragment=0, icmp_type=8):
     # Ethernet frame has padding deliberately excluded from Echo data.
     icmp = bytes([icmp_type, 0, 0, 0]) + struct.pack("!HH", 7, 11) + payload
     ip = (bytes([0x45, 0]) + struct.pack("!H", 20 + len(icmp))
           + struct.pack("!HH", 0, fragment) + bytes([64, 1, 0, 0])
           + ipaddress.IPv4Address("192.0.2.10").packed
           + ipaddress.IPv4Address("198.51.100.20").packed)
-    return bytes(12) + b"\\x08\\x00" + ip + icmp + b"\\x00" * 6
+    return bytes(12) + b"\x08\x00" + ip + icmp + b"\x00" * 6
 
 
 def packet_v6(payload=b"V6", *, extension=False):
@@ -30,7 +30,7 @@ def packet_v6(payload=b"V6", *, extension=False):
               + bytes([0 if extension else 58, 64])
               + ipaddress.IPv6Address("2001:db8::1").packed
               + ipaddress.IPv6Address("2001:db8::2").packed)
-    return bytes(12) + b"\\x86\\xdd" + header + ext + icmp
+    return bytes(12) + b"\x86\xdd" + header + ext + icmp
 
 
 def raw_packet(frame, protocol="icmpv4", extension=False):
@@ -69,22 +69,21 @@ def case(tmp_path: Path, raw):
     (tmp_path / "case.pcap").write_bytes(bytes.fromhex("d4c3b2a1") + bytes(24))
     engine = InvestigationEngine(CaptureStore(tmp_path), Runner(raw))
     capture_id = engine.store.list()[0]["capture_id"]
-    digest = engine.inspect_capture(capture_id)["sha256"] if False else hashlib.sha256(
-        (tmp_path / "case.pcap").read_bytes()).hexdigest()
+    digest = hashlib.sha256((tmp_path / "case.pcap").read_bytes()).hexdigest()
     return engine, capture_id, digest
 
 
 def test_v4_padding_excluded_and_bounded(tmp_path):
-    wire = packet_v4(b"AB\\x00\\xffZ")
+    wire = packet_v4(b"AB\x00\xffZ")
     engine, capture_id, digest = case(tmp_path, raw_packet(wire))
     result = inspect_icmp_payload(engine, capture_id, 1, digest, 3)
     assert result["status"] == "ok"
-    assert result["payload_hex"] == b"AB\\x00".hex()
+    assert result["payload_hex"] == b"AB\x00".hex()
     assert result["payload_ascii"] == "AB."
     assert result["payload_bytes"] == 5
     assert result["payload_truncated"] is True
     assert result["payload_offset_in_frame"] == 42
-    assert result["payload_sha256"] == hashlib.sha256(b"AB\\x00\\xffZ").hexdigest()
+    assert result["payload_sha256"] == hashlib.sha256(b"AB\x00\xffZ").hexdigest()
     assert result["frame_sha256"] == hashlib.sha256(wire).hexdigest()
     assert result["identifier"] == 7 and result["sequence"] == 11
     assert result["untrusted_data"] is True
