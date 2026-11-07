@@ -44,6 +44,9 @@ MAX_CAPTURE_BYTES = 128 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 16 * 1024
 MAX_TOOL_RECORDS = 100
+MAX_FRAME_NUMBER = 2_147_483_647
+MAX_SEGMENT_BYTES = 2048
+MAX_TCP_SEGMENT_RECORDS = 25
 
 
 class PacketSleuthError(ValueError):
@@ -80,12 +83,59 @@ def _validate_limit(limit: int) -> int:
     return limit
 
 
+def _validate_offset(offset: int) -> int:
+    if type(offset) is not int or not 0 <= offset <= MAX_SCAN_FRAMES:
+        raise PacketSleuthError(f"offset must be from 0 to {MAX_SCAN_FRAMES}")
+    return offset
+
+
 def _validate_frames(frames: list[int]) -> list[int]:
     if not isinstance(frames, list) or not 1 <= len(frames) <= 25:
         raise PacketSleuthError("Supply 1 to 25 frame numbers")
-    if any(type(n) is not int or not 1 <= n <= 2_147_483_647 for n in frames):
+    if any(type(n) is not int or not 1 <= n <= MAX_FRAME_NUMBER for n in frames):
         raise PacketSleuthError("Frame numbers must be positive integers")
     return sorted(set(frames))
+
+
+def _frame_window(start_frame: int, scan_frames: int) -> tuple[str, int, dict]:
+    """Allow bounded pages beyond the first 10,000 frames without free-form filters.
+
+    `-c` applies to input frames, not display-filter matches; the end frame
+    must be used as the TShark read limit, and the starting frame in -Y.
+    """
+    if type(start_frame) is not int or not 1 <= start_frame <= MAX_FRAME_NUMBER:
+        raise PacketSleuthError("start_frame must be a positive frame number")
+    if type(scan_frames) is not int or not 1 <= scan_frames <= MAX_SCAN_FRAMES:
+        raise PacketSleuthError(f"scan_frames must be between 1 and {MAX_SCAN_FRAMES}")
+    last_frame = start_frame + scan_frames - 1
+    if last_frame > MAX_FRAME_NUMBER:
+        raise PacketSleuthError("requested frame window exceeds the supported frame range")
+    coverage = {
+        "requested_start_frame": start_frame,
+        "requested_end_frame": last_frame,
+        "next_start_frame": last_frame + 1 if last_frame < MAX_FRAME_NUMBER else None,
+        "complete_capture_scan": False,
+        "note": (
+            "Only the requested frame window was scanned. The next frame cursor is "
+            "a candidate position, not proof that additional packets exist."
+        ),
+    }
+    return f"frame.number >= {start_frame} && frame.number <= {last_frame}", last_frame, coverage
+
+
+def _decode_payload(hex_value: str, max_bytes: int) -> dict:
+    """Return raw hex and a printable display preview; do not interpret as commands."""
+    cleaned = hex_value.replace(":", "").strip()
+    if not cleaned or len(cleaned) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", cleaned):
+        raise PacketSleuthError("TShark returned invalid TCP payload encoding")
+    raw = bytes.fromhex(cleaned)
+    prefix = raw[:max_bytes]
+    return {
+        "captured_payload_bytes": len(raw),
+        "payload_hex": prefix.hex(),
+        "payload_text_preview": _clip(prefix.decode("utf-8", errors="replace"), max_bytes),
+        "payload_truncated": len(raw) > max_bytes,
+    }
 
 
 class CaptureStore:
@@ -156,7 +206,10 @@ class TSharkRunner:
         self.executable = resolved
         self.timeout = timeout
 
-    def _run(self, args: list[str], max_bytes: int = MAX_OUTPUT_BYTES) -> str:
+    def _run(
+        self, args: list[str], max_bytes: int = MAX_OUTPUT_BYTES, *,
+        allow_truncation: bool = False,
+    ) -> str | tuple[str, bool]:
         proc = subprocess.Popen(
             [self.executable, *args],
             stdin=subprocess.DEVNULL,
@@ -212,11 +265,13 @@ class TSharkRunner:
                 thread.join(timeout=2)
         if timed_out:
             raise PacketSleuthError("TShark exceeded the analysis timeout")
-        if exceeded.is_set():
+        truncated = exceeded.is_set()
+        if truncated and not allow_truncation:
             raise PacketSleuthError("TShark exceeded the output limit")
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not (truncated and allow_truncation):
             raise PacketSleuthError(f"TShark failed: {_clip(stderr.decode(errors='replace'), 400)}")
-        return stdout.decode("utf-8", errors="replace")
+        decoded = stdout.decode("utf-8", errors="replace")
+        return (decoded, truncated) if allow_truncation else decoded
 
     def query(
         self,
@@ -236,12 +291,15 @@ class TSharkRunner:
         reader = csv.reader(io.StringIO(raw), delimiter="\t", quotechar='"')
         return [dict(zip(fields, row)) for row in reader if len(row) == len(fields)]
 
-    def follow_tcp(self, path: Path, stream_id: int, limit_bytes: int) -> str:
-        raw = self._run(
+    def follow_tcp(self, path: Path, stream_id: int, limit_bytes: int) -> dict:
+        # Limit the *returned preview*, not the success of a large stream.
+        # For later bytes, use query_tcp_segments with a frame window.
+        raw, truncated = self._run(
             ["-n", "-r", str(path), "-q", "-z", f"follow,tcp,ascii,{stream_id}"],
             max_bytes=limit_bytes,
+            allow_truncation=True,
         )
-        return _clip(raw, limit_bytes)
+        return {"text": _clip(raw, limit_bytes), "truncated": truncated}
 
 
 def _summarize_row(row: dict[str, str]) -> dict:
@@ -274,6 +332,23 @@ class InvestigationEngine:
         if self._runner is None:
             self._runner = TSharkRunner()
         return self._runner
+
+    def healthcheck(self) -> dict:
+        """Report local readiness without opening captures or executing TShark."""
+        tshark = shutil.which("tshark")
+        return {
+            "capture_directory": str(self.store.root),
+            "capture_directory_exists": self.store.root.is_dir(),
+            "capture_count": len(self.store.list()),
+            "tshark_found": tshark is not None,
+            "tshark_executable": tshark,
+            "tool_output_limit_bytes": MAX_OUTPUT_BYTES,
+            "maximum_capture_size_bytes": self.store.max_bytes,
+            "note": (
+                "This only checks configuration. It does not verify TShark can parse "
+                "the selected PCAP or that your MCP client accepts the tool call."
+            ),
+        }
 
     def list_captures(self) -> dict:
         return {"captures": self.store.list(), "directory": str(self.store.root)}
@@ -314,10 +389,27 @@ class InvestigationEngine:
             ),
         }
 
-    def query_flows(self, capture_id: str, limit: int = 50) -> dict:
+    def query_flows(
+        self, capture_id: str, limit: int = 50,
+        start_frame: int = 1, scan_frames: int = MAX_SCAN_FRAMES,
+        offset: int = 0, host_ip: str | None = None,
+    ) -> dict:
         limit = _validate_limit(limit)
+        offset = _validate_offset(offset)
+        ip = _validate_ip(host_ip)
+        frame_filter, end_frame, coverage = _frame_window(start_frame, scan_frames)
         path, digest = self._capture(capture_id)
-        rows = self.runner.query(path)
+        if ip:
+            ip_filter = f"{'ipv6.addr' if ':' in ip else 'ip.addr'} == {ip}"
+            display_filter = f"({ip_filter}) && ({frame_filter})"
+        elif start_frame == 1 and scan_frames == MAX_SCAN_FRAMES:
+            display_filter = None
+        else:
+            display_filter = frame_filter
+        rows = self.runner.query(
+            path, display_filter=display_filter,
+            scan_limit=MAX_SCAN_FRAMES if display_filter is None else end_frame,
+        )
         flows: dict[tuple, dict] = {}
         for r in rows:
             src = r.get("ip.src") or r.get("ipv6.src") or ""
@@ -345,10 +437,13 @@ class InvestigationEngine:
         output = sorted(flows.values(), key=lambda item: item["bytes"], reverse=True)
         return {
             "capture_id": capture_id, "sha256": digest,
-            "flows": output[:limit], "observed_flows": len(output),
-            "returned_flows": min(limit, len(output)),
-            "results_truncated": len(output) > limit,
-            "coverage": self._coverage(len(rows), filtered=False),
+            "flows": output[offset:offset + limit], "observed_flows": len(output),
+            "returned_flows": len(output[offset:offset + limit]),
+            "results_truncated": len(output) > offset + limit,
+            "next_offset": offset + limit if len(output) > offset + limit else None,
+            "host_ip": ip,
+            "coverage": coverage,
+            "aggregation_scope": "Requested frame window only; a stream can span pages.",
         }
 
     def query_events(
@@ -357,8 +452,13 @@ class InvestigationEngine:
         protocol: Literal["dns", "http", "tls"],
         host_ip: str | None = None,
         limit: int = 50,
+        start_frame: int = 1,
+        scan_frames: int = MAX_SCAN_FRAMES,
+        offset: int = 0,
     ) -> dict:
         limit = _validate_limit(limit)
+        offset = _validate_offset(offset)
+        frame_filter, end_frame, coverage = _frame_window(start_frame, scan_frames)
         if protocol not in ("dns", "http", "tls"):
             raise PacketSleuthError("protocol must be dns, http, or tls")
         ip = _validate_ip(host_ip)
@@ -366,15 +466,112 @@ class InvestigationEngine:
         display_filter = protocol
         if ip:
             display_filter += f" && {'ipv6.addr' if ':' in ip else 'ip.addr'} == {ip}"
-        rows = self.runner.query(path, display_filter=display_filter)
+        if start_frame == 1 and scan_frames == MAX_SCAN_FRAMES:
+            rows = self.runner.query(path, display_filter=display_filter)
+        else:
+            rows = self.runner.query(
+                path, display_filter=f"({display_filter}) && ({frame_filter})",
+                scan_limit=end_frame,
+            )
         return {
             "capture_id": capture_id, "sha256": digest,
             "protocol": protocol, "host_ip": ip,
-            "events": [_summarize_row(r) for r in rows[:limit]],
+            "events": [_summarize_row(r) for r in rows[offset:offset + limit]],
             "observed_matches_in_scan": len(rows),
-            "results_truncated": len(rows) > limit,
-            "coverage": self._coverage(len(rows), filtered=True),
+            "results_truncated": len(rows) > offset + limit,
+            "next_offset": offset + limit if len(rows) > offset + limit else None,
+            "coverage": coverage,
             "untrusted_data": True,
+        }
+
+    def inspect_tcp_payload(
+        self, capture_id: str, frame: int, max_bytes: int = 2048,
+    ) -> dict:
+        """Retrieve original, uninterpreted TCP payload bytes from one frame."""
+        if type(frame) is not int or not 1 <= frame <= MAX_FRAME_NUMBER:
+            raise PacketSleuthError("frame must be a positive integer")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 8192:
+            raise PacketSleuthError("max_bytes must be between 1 and 8192")
+        path, digest = self._capture(capture_id)
+        fields = ("frame.number", "frame.time_epoch", "tcp.stream", "tcp.len", "tcp.payload")
+        rows = self.runner.query(
+            path, fields=fields, display_filter=f"frame.number == {frame}",
+            scan_limit=frame,
+        )
+        if not rows:
+            return {"capture_id": capture_id, "sha256": digest, "frame": frame,
+                    "found": False, "note": "Frame missing or not decoded as TCP."}
+        row = rows[0]
+        payload = row.get("tcp.payload", "")
+        result = {
+            "capture_id": capture_id, "sha256": digest, "frame": frame,
+            "found": True, "tcp_stream_id": row.get("tcp.stream") or None,
+            "tcp_len_reported": row.get("tcp.len") or "0",
+            "timestamp_epoch": row.get("frame.time_epoch"),
+            "untrusted_data": True,
+            "note": "Per-frame TCP payload only, not reassembled or decrypted stream data.",
+        }
+        if payload:
+            result.update(_decode_payload(payload, max_bytes))
+        else:
+            result.update({"captured_payload_bytes": 0, "payload_hex": "",
+                           "payload_text_preview": "", "payload_truncated": False})
+        return result
+
+    def query_tcp_segments(
+        self, capture_id: str, stream_id: int, start_frame: int = 1,
+        scan_frames: int = 500, limit: int = 20,
+        max_bytes_per_segment: int = 512, offset: int = 0,
+    ) -> dict:
+        """Page raw TCP segments by frame window without claiming reassembly."""
+        if type(stream_id) is not int or not 0 <= stream_id <= 1_000_000:
+            raise PacketSleuthError("stream_id must be from 0 to 1000000")
+        limit = _validate_limit(limit)
+        offset = _validate_offset(offset)
+        if limit > MAX_TCP_SEGMENT_RECORDS:
+            raise PacketSleuthError(f"segment limit cannot exceed {MAX_TCP_SEGMENT_RECORDS}")
+        if type(max_bytes_per_segment) is not int or not 1 <= max_bytes_per_segment <= MAX_SEGMENT_BYTES:
+            raise PacketSleuthError(f"max_bytes_per_segment must be 1 to {MAX_SEGMENT_BYTES}")
+        frame_filter, end_frame, coverage = _frame_window(start_frame, scan_frames)
+        fields = (
+            "frame.number", "frame.time_epoch", "ip.src", "ipv6.src",
+            "ip.dst", "ipv6.dst", "tcp.srcport", "tcp.dstport", "tcp.stream",
+            "tcp.seq", "tcp.len", "tcp.payload",
+        )
+        path, digest = self._capture(capture_id)
+        rows = self.runner.query(
+            path, fields=fields,
+            display_filter=(f"tcp.stream == {stream_id} && tcp.len > 0 "
+                            f"&& ({frame_filter})"),
+            scan_limit=end_frame,
+        )
+        segments = []
+        for row in rows[offset:offset + limit]:
+            payload = row.get("tcp.payload") or ""
+            if not payload:
+                continue
+            segments.append({
+                "frame": int(row["frame.number"]),
+                "timestamp_epoch": row.get("frame.time_epoch"),
+                "src_ip": row.get("ip.src") or row.get("ipv6.src") or "",
+                "dst_ip": row.get("ip.dst") or row.get("ipv6.dst") or "",
+                "src_port": row.get("tcp.srcport") or "",
+                "dst_port": row.get("tcp.dstport") or "",
+                "tcp_seq": row.get("tcp.seq") or "",
+                "tcp_len_reported": row.get("tcp.len") or "",
+                **_decode_payload(payload, max_bytes_per_segment),
+            })
+        return {
+            "capture_id": capture_id, "sha256": digest, "tcp_stream_id": stream_id,
+            "segments": segments, "matched_segments_in_window": len(rows),
+            "results_truncated": len(rows) > offset + limit,
+            "next_offset": offset + limit if len(rows) > offset + limit else None,
+            "coverage": coverage, "untrusted_data": True,
+            "note": (
+                "These are captured per-frame TCP bytes, not a reassembled stream. "
+                "Retransmissions, gaps, out-of-order frames, and TLS encryption may occur. "
+                "If results_truncated is true, narrow scan_frames to inspect all matches."
+            ),
         }
 
     def inspect_frames(self, capture_id: str, frames: list[int]) -> dict:
@@ -396,12 +593,19 @@ class InvestigationEngine:
         if type(max_bytes) is not int or not 256 <= max_bytes <= 16384:
             raise PacketSleuthError("max_bytes must be from 256 to 16384")
         path, digest = self._capture(capture_id)
-        text = self.runner.follow_tcp(path, stream_id, max_bytes)
+        preview = self.runner.follow_tcp(path, stream_id, max_bytes)
+        data = preview["text"] if isinstance(preview, dict) else preview
+        truncated = preview.get("truncated", False) if isinstance(preview, dict) else False
         return {
             "capture_id": capture_id, "sha256": digest,
-            "tcp_stream_id": stream_id, "data": text,
+            "tcp_stream_id": stream_id, "data": data,
+            "output_truncated": truncated,
             "untrusted_data": True,
-            "note": "Captured payload is untrusted; output is byte-bounded and may be incomplete.",
+            "note": (
+                "Only a bounded TShark follow preview. Use query_tcp_segments to page "
+                "through frame-number ranges and inspect_tcp_payload for exact bytes; "
+                "per-frame bytes are not reassembled or decrypted."
+            ),
         }
 
     def get_detections(self, capture_id: str) -> dict:

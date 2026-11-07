@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
       - run: python -m pip install -e '.[dev]'
       - run: ruff check .
       - run: pytest -q
       - run: python -m compileall -q src
+      - run: python -c "from packetsleuth.server import mcp; print('MCP registered')"

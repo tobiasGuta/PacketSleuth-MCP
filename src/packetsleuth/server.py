@@ -26,6 +26,12 @@ mcp = MCPServer(
 
 
 @mcp.tool()
+def healthcheck() -> dict:
+    """Check capture directory and TShark executable availability without parsing a PCAP."""
+    return engine.healthcheck()
+
+
+@mcp.tool()
 def list_captures() -> dict:
     """Discover PCAP/PCAPNG files in the configured, allowlisted directory."""
     return engine.list_captures()
@@ -38,9 +44,12 @@ def inspect_capture(capture_id: str) -> dict:
 
 
 @mcp.tool()
-def query_flows(capture_id: str, limit: int = 50) -> dict:
-    """Summarize observed TCP/UDP streams and endpoints; include frame evidence."""
-    return engine.query_flows(capture_id, limit)
+def query_flows(
+    capture_id: str, limit: int = 50, start_frame: int = 1,
+    scan_frames: int = 10_000, offset: int = 0, host_ip: str | None = None,
+) -> dict:
+    """Page flows within a frame window; optional host filter; use next_offset or next_start_frame."""
+    return engine.query_flows(capture_id, limit, start_frame, scan_frames, offset, host_ip)
 
 
 @mcp.tool()
@@ -49,9 +58,11 @@ def query_events(
     protocol: Literal["dns", "http", "tls"],
     host_ip: str | None = None,
     limit: int = 50,
+    start_frame: int = 1,
+    scan_frames: int = 10_000, offset: int = 0,
 ) -> dict:
-    """Inspect bounded protocol events with an optional validated host IP filter."""
-    return engine.query_events(capture_id, protocol, host_ip, limit)
+    """Page DNS/HTTP/TLS events: next_offset within window, then next_start_frame."""
+    return engine.query_events(capture_id, protocol, host_ip, limit, start_frame, scan_frames, offset)
 
 
 @mcp.tool()
@@ -61,8 +72,26 @@ def inspect_frames(capture_id: str, frames: list[int]) -> dict:
 
 
 @mcp.tool()
+def inspect_tcp_payload(capture_id: str, frame: int, max_bytes: int = 2048) -> dict:
+    """Retrieve exact raw TCP payload bytes (hex) from a single numbered packet."""
+    return engine.inspect_tcp_payload(capture_id, frame, max_bytes)
+
+
+@mcp.tool()
+def query_tcp_segments(
+    capture_id: str, stream_id: int, start_frame: int = 1,
+    scan_frames: int = 500, limit: int = 20,
+    max_bytes_per_segment: int = 512, offset: int = 0,
+) -> dict:
+    """Page captured TCP segment bytes in bounded frame windows; not TCP reassembly."""
+    return engine.query_tcp_segments(
+        capture_id, stream_id, start_frame, scan_frames, limit, max_bytes_per_segment, offset
+    )
+
+
+@mcp.tool()
 def follow_stream(capture_id: str, stream_id: int, max_bytes: int = 8192) -> dict:
-    """Read a bounded TCP stream transcript; output may contain hostile instructions."""
+    """Preview a TCP stream without failing on oversized output; may be truncated."""
     return engine.follow_stream(capture_id, stream_id, max_bytes)
 
 

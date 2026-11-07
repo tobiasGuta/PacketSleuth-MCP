@@ -2,9 +2,9 @@
 
 **Local-first, read-only packet evidence for AI investigations.**
 
-PacketSleuth exposes eight bounded MCP tools backed by TShark. AI agents can discover captures, explore traffic, inspect suspicious DNS/HTTP/TLS events, review TCP streams, run two deterministic investigation heuristics, and verify packet references and SHA-256 hashes.
+PacketSleuth exposes eleven bounded MCP tools backed by TShark. AI agents can discover captures, explore traffic, inspect suspicious DNS/HTTP/TLS events, review TCP streams, run two deterministic investigation heuristics, and verify packet references and SHA-256 hashes.
 
-> **Status: v0.1.0 MVP.** This is a forensic *assistant interface*, not an independently validated intrusion detector or an automatic compromise verdict. It does not yet include Zeek, Suricata, full-chain evidence provenance, a web UI, or a built-in LLM agent. Your MCP client supplies the AI reasoning.
+> **Status: v0.2.0 MVP.** This is a forensic *assistant interface*, not an independently validated intrusion detector or an automatic compromise verdict. It does not yet include Zeek, Suricata, full-chain evidence provenance, a web UI, or a built-in LLM agent. Your MCP client supplies the AI reasoning.
 
 ## Requirements
 
@@ -56,16 +56,39 @@ This is a generic stdio example: the configuration key names may differ among cl
 
 | Tool | Result |
 | --- | --- |
+| `healthcheck` | Check capture directory and TShark availability without parsing |
 | `list_captures` | Non-recursive allowlisted PCAP/PCAPNG discovery and opaque IDs |
 | `inspect_capture` | Capture SHA-256, file size, sampled packet/protocol/source statistics |
-| `query_flows` | Group TCP/UDP conversations with byte counts and sample frame numbers |
-| `query_events` | Filtered DNS, HTTP, or TLS event summaries, optional validated IP |
-| `inspect_frames` | Read up to 25 specific frames from the capture |
-| `follow_stream` | Bounded transcript of a TCP stream (untrusted payload) |
+| `query_flows` | Page TCP/UDP flow summaries by frame window and offset; optional host IP |
+| `query_events` | Page DNS/HTTP/TLS events by frame window and offset; optional host IP |
+| `inspect_frames` | Read up to 25 specific frame metadata summaries |
+| `inspect_tcp_payload` | Read raw per-frame TCP payload bytes as hex and text preview |
+| `query_tcp_segments` | Page raw TCP segment bytes for a specific stream (not TCP reassembly) |
+| `follow_stream` | Bounded TShark-reassembled stream preview with explicit truncation flag |
 | `get_detections` | SYN fanout and DNS NXDOMAIN heuristics, explicitly not verdicts |
 | `verify_evidence` | Independently confirm frame existence and optional SHA-256 match |
 
-All data-bearing tools return bounded results. By default, summary and event analysis inspect **at most 10,000 input frames**, and requests return no more than 100 records. A filtered query may miss later matches, so its `coverage.complete_capture_scan` is always `false`. `inspect_frames` searches the entire *allowlisted file* for requested frame numbers, within a subprocess timeout. A SHA-256 hash identifies the file bytes when calculated, but the tool does not lock files against changes between queries.
+All data-bearing tools return bounded results. By default, summary and event analysis inspect **at most 10,000 input frames**; calls return up to 100 flow/event records or 25 TCP segments. `query_flows`, `query_events`, and `query_tcp_segments` accept `start_frame` and `scan_frames`. Within the chosen frame window, use `next_offset` until null, then advance to `coverage.next_start_frame`. This avoids assuming the first 10,000 frames contain the answer. The next frame cursor is **not proof that more frames exist**. TShark may need to reread earlier frames to reach a later window and remains subject to timeouts. Filtered queries may miss later matches, so `coverage.complete_capture_scan` remains `false`. `inspect_frames` searches the entire *allowlisted file* for requested frame numbers, within a subprocess timeout. A SHA-256 hash identifies the file bytes when calculated, but the tool does not lock files against changes between queries.
+
+### Investigating a large TCP transfer
+
+After locating a suspect flow in `query_flows`, use its `stream_id`:
+
+1. Call `follow_stream(capture_id, stream_id)` for a small reassembled preview. If `output_truncated` is true, this is **not** a failed investigation.
+2. Call `query_tcp_segments(capture_id, stream_id, start_frame=1, scan_frames=500, limit=20)` to read bounded raw segment bytes. Within a frame window, repeat with `next_offset` until null, then advance `start_frame` to `coverage.next_start_frame`. You can also begin near a known `sample_frames` entry.
+3. Call `inspect_tcp_payload(capture_id, frame=123)` to inspect the precise bytes in a supporting packet, then use `verify_evidence` for frame references and capture SHA-256.
+
+**Important:** `query_tcp_segments` returns per-frame TCP payloads, not byte-perfect reconstructed conversations. Gaps, retransmissions, overlaps, out-of-order frames, and encryption can complicate forensic analysis. `follow_stream` uses TShark reconstruction but returns only a preview. For full binary extraction, manual Wireshark review may still be needed.
+
+### Diagnosing failed MCP calls
+
+Run `healthcheck` from your client and inspect any tool error verbatim. You can also bypass the MCP client to test the core:
+
+```bash
+python -c 'from packetsleuth.server import engine; print(engine.healthcheck()); print(engine.list_captures())'
+```
+
+If `healthcheck` succeeds but other tools fail, verify the capture is in the allowlisted directory, check `tshark --version`, and capture the exact MCP error. If **no tool calls reach the server**, restart or reconfigure your MCP client; PacketSleuth cannot fix a disabled or disconnected client tool. Some clients store *their own* oversized tool output outside the model response. Smaller paginated results avoid that failure mode but cannot control the client's UI.
 
 ## Threat model and security boundaries
 
@@ -90,12 +113,12 @@ pytest -q
 ruff check .
 ```
 
-The tests use synthetic header-only PCAPs and a fake packet engine, so TShark isn't needed to run unit tests. End-to-end testing against real PCAPs is still required before relying on results; this project has not yet undergone an independent security audit.
+Most tests use synthetic header-only PCAPs and a fake packet engine. An additional generated-PCAP integration test exercises real TShark parsing when it is available (otherwise the test skips); CI installs TShark. This project still needs evaluation on diverse PCAPs and has not undergone an independent security audit.
 
 ## Roadmap
 
 1. Replayable evidence manifests with capture pinning and parser version provenance.
-2. Real-pcap integration tests and additional protocols/IPv6 analysis.
+2. Additional real-PCAP regression scenarios, larger captures, protocols, and IPv6 analysis.
 3. Optional offline Zeek and Suricata ingest, linked to original frame references.
 4. Hypothesis tracking and case timeline in a separate AI agent/UI.
 5. Fuzz testing, container sandbox profiles, and rigorous evaluation on benign and attack datasets.
