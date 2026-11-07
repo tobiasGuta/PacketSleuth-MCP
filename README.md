@@ -2,7 +2,7 @@
 
 **Local-first, read-only network evidence tools for AI-assisted investigations.**
 
-PacketSleuth provides **18 MCP tools** backed by TShark. The tools help an MCP-compatible AI client inspect unknown PCAP/PCAPNG captures, query decoded fields, navigate flows, retrieve packet bytes, reconstruct bounded TCP directions, and verify evidence. The AI client decides what to investigate; the server does not hardcode attack scenarios or challenge answers.
+PacketSleuth provides **19 MCP tools** backed by TShark. The tools help an MCP-compatible AI client inspect unknown PCAP/PCAPNG captures, query decoded fields, navigate flows, retrieve packet bytes, reconstruct bounded TCP directions, and verify evidence. The AI client decides what to investigate; the server does not hardcode attack scenarios or challenge answers.
 
 > **v0.3.0 experimental release.** The forensic operations are bounded and evidence-oriented, **not** a production security sensor, an autonomous intrusion-detection system, or a native-parser sandbox. It has no built-in LLM, no automatic malware verdicts, and no network egress. The Python virtual environment does not sandbox untrusted packet parsers.
 
@@ -60,7 +60,8 @@ When the client connects, start with `healthcheck`, `list_captures`, and `inspec
 | `list_captures` | Discover allowlisted, regular capture files using opaque IDs |
 | `inspect_capture` | File SHA-256 and sampled traffic overview |
 | `query_flows` | Rank bidirectional flows with bounded frame-window and offset paging |
-| `query_events` | Page DNS/HTTP/TLS summaries in bounded windows |
+| `query_events` | Page backward-compatible DNS/HTTP/TLS summaries with stable cursors |
+| `query_dns` | Inspect paged DNS questions, answers, IPs, TTLs, and query/response frame links |
 | `inspect_frames` | Verify and summarize specific frame numbers |
 | `inspect_tcp_payload` | Retrieve hex-encoded raw bytes from one TCP frame |
 | `inspect_icmp_payload` | Validate and extract bounded ICMPv4/v6 Echo data with frame/payload SHA-256 and offsets |
@@ -88,7 +89,61 @@ These tools are **general-purpose**: they do not contain capture-specific IPs, r
 
 If `results_truncated` is true, the returned `next_start_frame` points to the frame following the final returned match. If false, it points to the first frame after the scanned window. Repeat your query with the returned cursor and the same search constraints to continue. A cursor is a **candidate**, not proof that later frames exist or that the entire capture has been scanned. Every response identifies the requested window and pins the capture SHA-256.
 
-Older `query_flows`/`query_events` tools use `next_offset` **within a frame window**, then advance to `coverage.next_start_frame`. Flow aggregation is scoped to one window: a long flow may appear in multiple windows. Do not add window-level flow counts and call them full-session totals.
+Existing `query_flows`, `query_events`, and `query_tcp_segments` still accept `offset` and return `next_offset`, but now also support `cursor` and `next_cursor` **within a frame window**. Continue with the same filters, capture hash, and frame window. A cursor is rejected when the parameters or capture contents change. After the window, use `coverage.next_start_frame`. Flow aggregation is scoped to one window: a long flow may appear in multiple windows. Do not add window-level flow counts and call them full-session totals.
+
+## Complete DNS evidence
+
+Use `query_dns(capture_id, expected_sha256, start_frame=1, scan_frames=100,
+limit=5, cursor=None, max_records_per_message=32)` for detailed DNS messages,
+rather than the older `query_events(protocol="dns")` summary. The new tool
+returns query name/type, transaction ID, response code, all dissected questions,
+individual answer names/types, TTLs, IPv4/IPv6 answers, timestamps, exact frames,
+capture SHA-256, and TShark's `dns.response_to` / `dns.response_in` frame references.
+The capture digest is mandatory. The server does not invent missing DNS matches.
+
+Per request: at most **250 frame numbers scanned**, **10 messages returned**, and
+**64 DNS answer resource records per message**. Use `next_cursor` while `has_more`
+is true. Each response includes `scan_range`, `truncation`, `matched_in_window`,
+and `coverage`. Per-message `answers_truncated` and `record_parse_complete`
+are explicit: unfamiliar DNS record layouts may lack a decoded RDATA field and
+missing records are **not** silently treated as an empty answer set. Query/response
+references come from the TShark dissector and may be unavailable in incomplete
+captures. DNS responses on TCP are supported when TShark successfully dissects them.
+
+All legacy paged tools preserve `results_truncated` and cursor/offset fields,
+and add `has_more`, `next_cursor`, `scan_range`, and `truncation`. The
+`has_more` flag means **more results within the scanned window**, not proof that
+a capture contains no additional packets. Use `coverage.next_start_frame` to
+advance between bounded windows. Large TShark field output is automatically
+split into smaller frame ranges rather than silently dropping rows. If a single
+frame exceeds the configured parser budget, the tool returns an explicit
+`OUTPUT_LIMIT` error with guidance to narrow the operation.
+
+## Structured errors and operational controls
+
+MCP tools return their normal payload on success. Expected failures return
+`{"ok":false,"error":{"code":"...","message":"...","retryable":false}}`.
+Stable error codes are `INVALID_INPUT`, `CAPTURE_NOT_FOUND`,
+`PARSER_FAILURE`, `TIMEOUT`, `OUTPUT_LIMIT`, and
+`UNSUPPORTED_OPERATION`. The Python API retains exception behavior. Unknown
+programming errors are not rewritten into successful or empty results.
+
+Limits can be configured with environment variables (defaults in parentheses):
+
+- `PACKETSLEUTH_MAX_CAPTURE_BYTES` — capture allowlist threshold (134217728;
+  safety maximum 1073741824).
+- `PACKETSLEUTH_MAX_SCAN_FRAMES` — per-window frame ceiling (10000;
+  safety maximum 10000).
+- `PACKETSLEUTH_MAX_OUTPUT_BYTES` — per-process captured stdout cap (4194304;
+  safety maximum 16777216).
+- `PACKETSLEUTH_TSHARK_TIMEOUT_SECONDS` — per-process deadline (20;
+  maximum 120).
+
+Invalid settings are rejected, not silently ignored. The server kills and reaps
+TShark subprocess groups on timeout and cancellation. These limits provide
+resource hygiene only; they do not replace an OS sandbox. `healthcheck` reports
+active limits. For large captures, use consecutive frame windows, not unbounded
+requests.
 
 ## Working with TCP bytes
 

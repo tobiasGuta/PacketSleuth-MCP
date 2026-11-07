@@ -23,6 +23,7 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Literal
+from xml.etree import ElementTree as ET
 
 ALLOWED_SUFFIXES = {".pcap", ".pcapng"}
 PCAP_MAGICS = {
@@ -51,7 +52,38 @@ MAX_TCP_SEGMENT_RECORDS = 25
 
 
 class PacketSleuthError(ValueError):
-    """Expected, safe-to-surface operation error."""
+    """Expected operation failure with a stable, machine-readable error category."""
+
+    CODES = frozenset({
+        "INVALID_INPUT", "CAPTURE_NOT_FOUND", "PARSER_FAILURE",
+        "TIMEOUT", "OUTPUT_LIMIT", "UNSUPPORTED_OPERATION",
+    })
+
+    def __init__(self, message: str, *, code: str = "INVALID_INPUT"):
+        if code not in self.CODES:
+            raise ValueError("Unknown PacketSleuth error code")
+        self.code = code
+        super().__init__(message)
+
+    def as_dict(self) -> dict:
+        return {
+            "ok": False, "error": {
+                "code": self.code, "message": str(self),
+                "retryable": self.code in {"TIMEOUT", "OUTPUT_LIMIT"},
+            },
+        }
+
+
+def _setting(name: str, default: int, maximum: int, minimum: int = 1) -> int:
+    """Bound environment overrides; invalid configuration never silently falls back."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if not raw.isdecimal() or not minimum <= int(raw) <= maximum:
+        raise PacketSleuthError(
+            f"{name} must be an integer between {minimum} and {maximum}"
+        )
+    return int(raw)
 
 
 def _clip(value: str, limit: int = 300) -> str:
@@ -106,8 +138,9 @@ def _frame_window(start_frame: int, scan_frames: int) -> tuple[str, int, dict]:
     """
     if type(start_frame) is not int or not 1 <= start_frame <= MAX_FRAME_NUMBER:
         raise PacketSleuthError("start_frame must be a positive frame number")
-    if type(scan_frames) is not int or not 1 <= scan_frames <= MAX_SCAN_FRAMES:
-        raise PacketSleuthError(f"scan_frames must be between 1 and {MAX_SCAN_FRAMES}")
+    max_scan = _setting("PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES)
+    if type(scan_frames) is not int or not 1 <= scan_frames <= max_scan:
+        raise PacketSleuthError(f"scan_frames must be between 1 and {max_scan}")
     last_frame = start_frame + scan_frames - 1
     if last_frame > MAX_FRAME_NUMBER:
         raise PacketSleuthError("requested frame window exceeds the supported frame range")
@@ -128,7 +161,9 @@ def _decode_payload(hex_value: str, max_bytes: int) -> dict:
     """Return raw hex and a printable display preview; do not interpret as commands."""
     cleaned = hex_value.replace(":", "").strip()
     if not cleaned or len(cleaned) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", cleaned):
-        raise PacketSleuthError("TShark returned invalid TCP payload encoding")
+        raise PacketSleuthError(
+            "TShark returned invalid TCP payload encoding", code="PARSER_FAILURE"
+        )
     raw = bytes.fromhex(cleaned)
     prefix = raw[:max_bytes]
     return {
@@ -142,9 +177,15 @@ def _decode_payload(hex_value: str, max_bytes: int) -> dict:
 class CaptureStore:
     """Allowlisted, non-recursive capture directory; identifiers are not paths."""
 
-    def __init__(self, root: Path, max_bytes: int = MAX_CAPTURE_BYTES):
+    def __init__(self, root: Path, max_bytes: int | None = None):
         self.root = Path(root).expanduser().resolve()
-        self.max_bytes = max_bytes
+        self.max_bytes = (
+            _setting("PACKETSLEUTH_MAX_CAPTURE_BYTES", MAX_CAPTURE_BYTES,
+                     1024 * 1024 * 1024, 4)
+            if max_bytes is None else max_bytes
+        )
+        if type(self.max_bytes) is not int or not 4 <= self.max_bytes <= 1024 ** 3:
+            raise PacketSleuthError("max_bytes must be between 4 and 1073741824")
 
     @staticmethod
     def _id(name: str) -> str:
@@ -183,14 +224,15 @@ class CaptureStore:
         return output
 
     def get(self, capture_id: str) -> Path:
-        if not re.fullmatch(r"[a-f0-9]{24}", capture_id):
-            raise PacketSleuthError("Unknown capture ID")
+        if not isinstance(capture_id, str) or not re.fullmatch(r"[a-f0-9]{24}", capture_id):
+            raise PacketSleuthError("Invalid capture ID")
         for item in self.list():
             if item["capture_id"] == capture_id:
                 path = self.root / item["filename"]
                 if self._valid_file(path) and path.resolve().parent == self.root:
                     return path
-        raise PacketSleuthError("Unknown capture ID")
+        raise PacketSleuthError("Capture not found in the allowlisted directory",
+                               code="CAPTURE_NOT_FOUND")
 
 
 class TSharkRunner:
@@ -200,36 +242,53 @@ class TSharkRunner:
     a timeout. This is resource hygiene, not a substitute for OS sandboxing.
     """
 
-    def __init__(self, executable: str = "tshark", timeout: float = 20.0):
+    def __init__(self, executable: str = "tshark", timeout: float | None = None):
         resolved = shutil.which(executable)
         if resolved is None:
-            raise PacketSleuthError("tshark not found on PATH; install Wireshark CLI tools")
+            raise PacketSleuthError("tshark not found on PATH; install Wireshark CLI tools",
+                                   code="UNSUPPORTED_OPERATION")
         self.executable = resolved
-        self.timeout = timeout
+        self.timeout = (
+            _setting("PACKETSLEUTH_TSHARK_TIMEOUT_SECONDS", 20, 120)
+            if timeout is None else timeout
+        )
+        if isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float)):
+            raise PacketSleuthError("timeout must be a positive number")
+        if not 0 < self.timeout <= 120:
+            raise PacketSleuthError("timeout must be greater than zero and at most 120")
+        self.max_output_bytes = _setting(
+            "PACKETSLEUTH_MAX_OUTPUT_BYTES", MAX_OUTPUT_BYTES, 16 * 1024 * 1024, 1024
+        )
 
     def _run(
         self, args: list[str], max_bytes: int = MAX_OUTPUT_BYTES, *,
         allow_truncation: bool = False,
     ) -> str | tuple[str, bool]:
-        proc = subprocess.Popen(
-            [self.executable, *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=(os.name == "posix"),
-        )
+        """Bound stdout/stderr, kill the whole process group, and reap on cancellation."""
+        max_bytes = min(max_bytes, self.max_output_bytes)
+        try:
+            proc = subprocess.Popen(
+                [self.executable, *args],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=(os.name == "posix"),
+            )
+        except OSError as exc:
+            raise PacketSleuthError(
+                f"TShark process could not start: {_clip(str(exc))}",
+                code="UNSUPPORTED_OPERATION",
+            ) from exc
         stdout = bytearray()
         stderr = bytearray()
         exceeded = threading.Event()
 
-        def drain(stream, target: bytearray, byte_cap: int) -> None:
+        def drain(stream, target: bytearray, cap: int) -> None:
             try:
                 while True:
                     chunk = stream.read(8192)
                     if not chunk:
                         break
-                    room = byte_cap - len(target)
-                    target.extend(chunk[: max(room, 0)])
+                    room = max(0, cap - len(target))
+                    target.extend(chunk[:room])
                     if len(chunk) > room:
                         exceeded.set()
                         break
@@ -238,39 +297,55 @@ class TSharkRunner:
 
         threads = [
             threading.Thread(target=drain, args=(proc.stdout, stdout, max_bytes), daemon=True),
-            threading.Thread(target=drain, args=(proc.stderr, stderr, MAX_STDERR_BYTES), daemon=True),
+            threading.Thread(
+                target=drain, args=(proc.stderr, stderr, MAX_STDERR_BYTES), daemon=True,
+            ),
         ]
-        for thread in threads:
-            thread.start()
-        deadline = time.monotonic() + self.timeout
+        started = []
         timed_out = False
         try:
+            for thread in threads:
+                thread.start()
+                started.append(thread)
+            deadline = time.monotonic() + self.timeout
             while proc.poll() is None:
                 if exceeded.is_set():
                     break
-                if time.monotonic() > deadline:
+                if time.monotonic() >= deadline:
                     timed_out = True
                     break
                 time.sleep(0.02)
+        finally:
+            # Runs even on KeyboardInterrupt/cancellation. Do not swallow the exception.
             if proc.poll() is None:
                 if os.name == "posix":
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 else:
                     proc.kill()
-            proc.wait(timeout=3)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            for thread in threads:
+            # After SIGKILL/Terminate, use the blocking OS reap path. A
+            # timeout-based wait can itself be interrupted during cancellation.
+            proc.wait()
+            for thread in started:
                 thread.join(timeout=2)
         if timed_out:
-            raise PacketSleuthError("TShark exceeded the analysis timeout")
+            raise PacketSleuthError(
+                "TShark exceeded the configured analysis timeout; narrow the frame window",
+                code="TIMEOUT",
+            )
         truncated = exceeded.is_set()
         if truncated and not allow_truncation:
-            raise PacketSleuthError("TShark exceeded the output limit")
+            raise PacketSleuthError(
+                "TShark exceeded the configured output limit; narrow the frame window",
+                code="OUTPUT_LIMIT",
+            )
         if proc.returncode != 0 and not (truncated and allow_truncation):
-            raise PacketSleuthError(f"TShark failed: {_clip(stderr.decode(errors='replace'), 400)}")
+            raise PacketSleuthError(
+                f"TShark parser failed: {_clip(stderr.decode(errors='replace'), 400)}",
+                code="PARSER_FAILURE",
+            )
         decoded = stdout.decode("utf-8", errors="replace")
         return (decoded, truncated) if allow_truncation else decoded
 
@@ -281,16 +356,87 @@ class TSharkRunner:
         display_filter: str | None = None,
         scan_limit: int | None = MAX_SCAN_FRAMES,
     ) -> list[dict[str, str]]:
-        args = ["-n", "-r", str(path), "-T", "fields", "-E", "separator=/t", "-E", "quote=d", "-E", "occurrence=f"]
+        args = [
+            "-n", "-r", str(path), "-T", "fields", "-E", "separator=/t",
+            "-E", "quote=d", "-E", "occurrence=f",
+        ]
         if scan_limit is not None:
             args.extend(["-c", str(scan_limit)])
         if display_filter:
             args.extend(["-Y", display_filter])
         for field in fields:
             args.extend(["-e", field])
-        raw = self._run(args)
-        reader = csv.reader(io.StringIO(raw), delimiter="\t", quotechar='"')
-        return [dict(zip(fields, row)) for row in reader if len(row) == len(fields)]
+        try:
+            raw = self._run(args)
+        except PacketSleuthError as exc:
+            if exc.code != "OUTPUT_LIMIT" or scan_limit is None or scan_limit <= 1:
+                raise
+            # Preserve exact rows across large windows instead of silently dropping
+            # over-limit output. Split at input frame boundaries; never retry timeouts.
+            middle = scan_limit // 2
+            left_filter = (
+                f"({display_filter}) && frame.number <= {middle}"
+                if display_filter else f"frame.number <= {middle}"
+            )
+            right_filter = (
+                f"({display_filter}) && frame.number > {middle}"
+                if display_filter else f"frame.number > {middle}"
+            )
+            return (
+                self.query(path, fields, left_filter, middle)
+                + self.query(path, fields, right_filter, scan_limit)
+            )
+        reader = csv.reader(
+            io.StringIO(raw), delimiter="\t", quotechar='"', strict=True,
+        )
+        results = []
+        try:
+            for index, row in enumerate(reader, 1):
+                if not row:
+                    continue
+                if len(row) != len(fields):
+                    raise PacketSleuthError(
+                        f"TShark returned {len(row)} columns instead of {len(fields)} "
+                        f"at decoded row {index}", code="PARSER_FAILURE",
+                    )
+                results.append(dict(zip(fields, row)))
+        except csv.Error as exc:
+            raise PacketSleuthError(
+                "TShark returned malformed delimited fields", code="PARSER_FAILURE"
+            ) from exc
+        return results
+
+    def dns_details(self, path: Path, frames: list[int], scan_limit: int) -> dict[int, ET.Element]:
+        """Return per-frame DNS PDML trees; packet selectors are validated integers."""
+        if len(frames) > 10 or any(type(n) is not int or n < 1 for n in frames):
+            raise PacketSleuthError("DNS detail request requires 1 to 10 frame numbers")
+        if not frames:
+            return {}
+        selector = " || ".join(f"frame.number == {frame}" for frame in frames)
+        raw = self._run([
+            "-n", "-r", str(path), "-c", str(scan_limit), "-Y", selector,
+            "-T", "pdml", "-J", "frame dns",
+        ])
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            raise PacketSleuthError("TShark returned malformed DNS PDML",
+                                   code="PARSER_FAILURE") from exc
+        packets = {}
+        for packet in root.findall("packet"):
+            numbers = [
+                node.attrib.get("show") for node in packet.iter("field")
+                if node.attrib.get("name") == "frame.number"
+            ]
+            if len(numbers) != 1 or not numbers[0].isdecimal():
+                raise PacketSleuthError("TShark returned DNS details without a frame ID",
+                                       code="PARSER_FAILURE")
+            frame = int(numbers[0])
+            if frame not in frames or frame in packets:
+                raise PacketSleuthError("Unexpected or duplicate DNS PDML frame",
+                                       code="PARSER_FAILURE")
+            packets[frame] = packet
+        return packets
 
     def raw_frame(self, path: Path, frame: int) -> dict | None:
         """Read one bounded TShark jsonraw packet, including raw-layer byte offsets."""
@@ -301,9 +447,9 @@ class TSharkRunner:
         try:
             packets = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise PacketSleuthError("TShark returned malformed raw-frame JSON") from exc
+            raise PacketSleuthError("TShark returned malformed raw-frame JSON", code="PARSER_FAILURE") from exc
         if not isinstance(packets, list) or len(packets) > 1:
-            raise PacketSleuthError("TShark returned an unexpected raw-frame result")
+            raise PacketSleuthError("TShark returned an unexpected raw-frame result", code="PARSER_FAILURE")
         return packets[0] if packets else None
 
     def follow_tcp(self, path: Path, stream_id: int, limit_bytes: int) -> dict:
@@ -334,6 +480,8 @@ def _summarize_row(row: dict[str, str]) -> dict:
                  "http.request.uri", "tls.handshake.extensions_server_name", "tcp.stream"):
         if row.get(name):
             result[name] = _clip(row[name])
+            if len(row[name]) > 300:
+                result.setdefault("truncated_fields", []).append(name)
     return result
 
 
@@ -357,7 +505,9 @@ class InvestigationEngine:
             "capture_count": len(self.store.list()),
             "tshark_found": tshark is not None,
             "tshark_executable": tshark,
-            "tool_output_limit_bytes": MAX_OUTPUT_BYTES,
+            "tool_output_limit_bytes": _setting("PACKETSLEUTH_MAX_OUTPUT_BYTES", MAX_OUTPUT_BYTES, 16 * 1024 * 1024, 1024),
+            "max_scan_frames": _setting("PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES),
+            "tshark_timeout_seconds": _setting("PACKETSLEUTH_TSHARK_TIMEOUT_SECONDS", 20, 120),
             "maximum_capture_size_bytes": self.store.max_bytes,
             "note": (
                 "This only checks configuration. It does not verify TShark can parse "
@@ -374,7 +524,10 @@ class InvestigationEngine:
 
     def inspect_capture(self, capture_id: str) -> dict:
         path, digest = self._capture(capture_id)
-        rows = self.runner.query(path)
+        scan_limit = _setting(
+            "PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES
+        )
+        rows = self.runner.query(path, scan_limit=scan_limit)
         sources = Counter((r.get("ip.src") or r.get("ipv6.src")) for r in rows)
         protocols = Counter((r.get("frame.protocols") or "unknown").split(":")[-1] for r in rows)
         count = len(rows)
@@ -393,14 +546,17 @@ class InvestigationEngine:
 
     @staticmethod
     def _coverage(count: int, filtered: bool) -> dict:
+        scan_limit = _setting(
+            "PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES
+        )
         return {
-            "scan_limit_frames": MAX_SCAN_FRAMES,
-            "complete_capture_scan": not filtered and count < MAX_SCAN_FRAMES,
+            "scan_limit_frames": scan_limit,
+            "complete_capture_scan": not filtered and count < scan_limit,
             "note": (
                 "Filtered results may exclude later capture frames; results are not exhaustive."
                 if filtered else
                 "At the configured frame limit, completeness is unknown."
-                if count >= MAX_SCAN_FRAMES else "All frames were scanned."
+                if count >= scan_limit else "All frames were scanned."
             ),
         }
 
@@ -408,9 +564,14 @@ class InvestigationEngine:
         self, capture_id: str, limit: int = 50,
         start_frame: int = 1, scan_frames: int = MAX_SCAN_FRAMES,
         offset: int = 0, host_ip: str | None = None,
+        cursor: str | None = None,
     ) -> dict:
+        from packetsleuth.pagination import decode_cursor, page
+
         limit = _validate_limit(limit)
         offset = _validate_offset(offset)
+        if cursor is not None and offset != 0:
+            raise PacketSleuthError("Supply cursor or offset, not both")
         ip = _validate_ip(host_ip)
         frame_filter, end_frame, coverage = _frame_window(start_frame, scan_frames)
         path, digest = self._capture(capture_id)
@@ -449,13 +610,25 @@ class InvestigationEngine:
             flow["bytes"] += int(r.get("frame.len") or 0)
             if len(flow["sample_frames"]) < 8:
                 flow["sample_frames"].append(int(r.get("frame.number") or 0))
+        for flow in flows.values():
+            flow["sample_frames_truncated"] = flow["packets"] > len(flow["sample_frames"])
         output = sorted(flows.values(), key=lambda item: item["bytes"], reverse=True)
+        scope = {
+            "tool": "query_flows", "capture_id": capture_id,
+            "start_frame": start_frame, "scan_frames": scan_frames, "host_ip": ip,
+        }
+        position = decode_cursor(cursor, digest, scope, 0, len(output))
+        if cursor is None:
+            position = offset
+        selected, meta = page(output, limit, position, digest, scope, start_frame, end_frame)
         return {
             "capture_id": capture_id, "sha256": digest,
-            "flows": output[offset:offset + limit], "observed_flows": len(output),
-            "returned_flows": len(output[offset:offset + limit]),
-            "results_truncated": len(output) > offset + limit,
-            "next_offset": offset + limit if len(output) > offset + limit else None,
+            "flows": selected, "observed_flows": len(output),
+            "returned_flows": len(selected),
+            "results_truncated": meta["results_truncated"],
+            "next_offset": meta["next_offset"],
+            "has_more": meta["has_more"], "next_cursor": meta["next_cursor"],
+            "scan_range": meta["scan_range"], "truncation": meta["truncation"],
             "host_ip": ip,
             "coverage": coverage,
             "aggregation_scope": "Requested frame window only; a stream can span pages.",
@@ -470,9 +643,14 @@ class InvestigationEngine:
         start_frame: int = 1,
         scan_frames: int = MAX_SCAN_FRAMES,
         offset: int = 0,
+        cursor: str | None = None,
     ) -> dict:
+        from packetsleuth.pagination import decode_cursor, page
+
         limit = _validate_limit(limit)
         offset = _validate_offset(offset)
+        if cursor is not None and offset != 0:
+            raise PacketSleuthError("Supply cursor or offset, not both")
         frame_filter, end_frame, coverage = _frame_window(start_frame, scan_frames)
         if protocol not in ("dns", "http", "tls"):
             raise PacketSleuthError("protocol must be dns, http, or tls")
@@ -488,15 +666,34 @@ class InvestigationEngine:
                 path, display_filter=f"({display_filter}) && ({frame_filter})",
                 scan_limit=end_frame,
             )
+        scope = {
+            "tool": "query_events", "capture_id": capture_id, "protocol": protocol,
+            "host_ip": ip, "start_frame": start_frame, "scan_frames": scan_frames,
+        }
+        position = decode_cursor(cursor, digest, scope, 0, len(rows))
+        if cursor is None:
+            position = offset
+        selected, meta = page(rows, limit, position, digest, scope, start_frame, end_frame)
+        events = [_summarize_row(r) for r in selected]
         return {
             "capture_id": capture_id, "sha256": digest,
             "protocol": protocol, "host_ip": ip,
-            "events": [_summarize_row(r) for r in rows[offset:offset + limit]],
+            "events": events,
             "observed_matches_in_scan": len(rows),
-            "results_truncated": len(rows) > offset + limit,
-            "next_offset": offset + limit if len(rows) > offset + limit else None,
+            "results_truncated": meta["results_truncated"],
+            "next_offset": meta["next_offset"],
+            "has_more": meta["has_more"], "next_cursor": meta["next_cursor"],
+            "scan_range": meta["scan_range"],
+            "truncation": meta["truncation"] | {
+                "field_values_truncated": any("truncated_fields" in event for event in events),
+            },
             "coverage": coverage,
             "untrusted_data": True,
+            "note": (
+                "DNS event summaries are backward-compatible previews. "
+                "Use query_dns for complete answer records and TTLs."
+                if protocol == "dns" else "Bounded frame-window event summaries."
+            ),
         }
 
     def inspect_tcp_payload(
@@ -537,12 +734,17 @@ class InvestigationEngine:
         self, capture_id: str, stream_id: int, start_frame: int = 1,
         scan_frames: int = 500, limit: int = 20,
         max_bytes_per_segment: int = 512, offset: int = 0,
+        cursor: str | None = None,
     ) -> dict:
         """Page raw TCP segments by frame window without claiming reassembly."""
+        from packetsleuth.pagination import decode_cursor, page
+
         if type(stream_id) is not int or not 0 <= stream_id <= 1_000_000:
             raise PacketSleuthError("stream_id must be from 0 to 1000000")
         limit = _validate_limit(limit)
         offset = _validate_offset(offset)
+        if cursor is not None and offset != 0:
+            raise PacketSleuthError("Supply cursor or offset, not both")
         if limit > MAX_TCP_SEGMENT_RECORDS:
             raise PacketSleuthError(f"segment limit cannot exceed {MAX_TCP_SEGMENT_RECORDS}")
         if type(max_bytes_per_segment) is not int or not 1 <= max_bytes_per_segment <= MAX_SEGMENT_BYTES:
@@ -560,8 +762,17 @@ class InvestigationEngine:
                             f"&& ({frame_filter})"),
             scan_limit=end_frame,
         )
+        scope = {
+            "tool": "query_tcp_segments", "capture_id": capture_id,
+            "stream_id": stream_id, "start_frame": start_frame,
+            "scan_frames": scan_frames, "max_bytes_per_segment": max_bytes_per_segment,
+        }
+        position = decode_cursor(cursor, digest, scope, 0, len(rows))
+        if cursor is None:
+            position = offset
+        selected, meta = page(rows, limit, position, digest, scope, start_frame, end_frame)
         segments = []
-        for row in rows[offset:offset + limit]:
+        for row in selected:
             payload = row.get("tcp.payload") or ""
             if not payload:
                 continue
@@ -579,8 +790,10 @@ class InvestigationEngine:
         return {
             "capture_id": capture_id, "sha256": digest, "tcp_stream_id": stream_id,
             "segments": segments, "matched_segments_in_window": len(rows),
-            "results_truncated": len(rows) > offset + limit,
-            "next_offset": offset + limit if len(rows) > offset + limit else None,
+            "results_truncated": meta["results_truncated"],
+            "next_offset": meta["next_offset"],
+            "has_more": meta["has_more"], "next_cursor": meta["next_cursor"],
+            "scan_range": meta["scan_range"], "truncation": meta["truncation"],
             "coverage": coverage, "untrusted_data": True,
             "note": (
                 "These are captured per-frame TCP bytes, not a reassembled stream. "
@@ -626,7 +839,10 @@ class InvestigationEngine:
     def get_detections(self, capture_id: str) -> dict:
         """Conservative heuristics; findings are leads, never compromise verdicts."""
         path, digest = self._capture(capture_id)
-        rows = self.runner.query(path)
+        scan_limit = _setting(
+            "PACKETSLEUTH_MAX_SCAN_FRAMES", MAX_SCAN_FRAMES, MAX_SCAN_FRAMES
+        )
+        rows = self.runner.query(path, scan_limit=scan_limit)
         scan_ports: dict[str, set[tuple[str, str]]] = defaultdict(set)
         scan_frames: dict[str, list[int]] = defaultdict(list)
         nxdomain_frames: dict[str, list[int]] = defaultdict(list)

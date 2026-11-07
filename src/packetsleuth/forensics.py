@@ -100,20 +100,27 @@ def query_packets(
     host_ip: str | None = None,
     start_frame: int = 1, scan_frames: int = 250, limit: int = 25,
     expected_sha256: str | None = None,
+    cursor: str | None = None,
 ) -> dict:
     """Search a bounded frame window and page by *frame number*, not result offset.
 
     The matching operation happens in Python on a fixed set of decoded fields,
     avoiding user-supplied display-filter expressions and injection issues.
     """
+    from packetsleuth.pagination import decode_cursor, encode_cursor
+
     if fields is None:
         fields = list(DEFAULT_FIELDS)
     if not isinstance(fields, list) or not 1 <= len(fields) <= MAX_QUERY_FIELDS:
         raise PacketSleuthError(f"Provide 1 to {MAX_QUERY_FIELDS} fields")
     if any(not isinstance(field, str) or field not in QUERY_FIELDS for field in fields):
-        raise PacketSleuthError("Unsupported query field; see list_query_fields")
+        raise PacketSleuthError(
+            "Unsupported query field; see list_query_fields", code="UNSUPPORTED_OPERATION"
+        )
     if match_field is not None and match_field not in QUERY_FIELDS:
-        raise PacketSleuthError("Unsupported match_field; see list_query_fields")
+        raise PacketSleuthError(
+            "Unsupported match_field; see list_query_fields", code="UNSUPPORTED_OPERATION"
+        )
     if (match_field is None) != (match_value is None):
         raise PacketSleuthError("match_field and match_value must be supplied together")
     if match_value is not None and (not isinstance(match_value, str) or len(match_value) > 128
@@ -129,6 +136,14 @@ def query_packets(
                                      *((match_field,) if match_field else ()),
                                      *(("ip.src", "ip.dst", "ipv6.src", "ipv6.dst") if ip else ()))))
     path, digest = _capture_pinned(engine, capture_id, expected_sha256)
+    scope = {
+        "tool": "query_packets", "capture_id": capture_id, "fields": fields,
+        "match_field": match_field, "match_value": match_value, "match_mode": match_mode,
+        "host_ip": ip, "start_frame": start_frame, "scan_frames": scan_frames,
+    }
+    position = decode_cursor(cursor, digest, scope, start_frame, end_frame)
+    if position != start_frame:
+        frame_filter = f"frame.number >= {position} && frame.number <= {end_frame}"
     rows = engine.runner.query(path, fields=requested, display_filter=frame_filter,
                                scan_limit=end_frame)
     matches = []
@@ -142,18 +157,30 @@ def query_packets(
                 continue
             if match_mode == "contains" and match_value.casefold() not in value.casefold():
                 continue
-        matches.append({field: _clip(row.get(field, ""), 256) for field in fields}
-                       | {"frame": int(row["frame.number"])})
+        record = {field: _clip(row.get(field, ""), 256) for field in fields}
+        truncated = [field for field in fields if len(row.get(field, "")) > 256]
+        if truncated:
+            record["truncated_fields"] = truncated
+        record["frame"] = int(row["frame.number"])
+        matches.append(record)
     _assert_unchanged(path, digest)
-    if len(matches) > limit:
-        next_frame = matches[limit - 1]["frame"] + 1
-    else:
-        next_frame = coverage["next_start_frame"]
+    has_more = len(matches) > limit
+    next_frame = (
+        matches[limit - 1]["frame"] + 1
+        if has_more else coverage["next_start_frame"]
+    )
     return {
         "capture_id": capture_id, "sha256": digest, "records": matches[:limit],
         "matched_in_window": len(matches), "returned": min(len(matches), limit),
-        "results_truncated": len(matches) > limit,
+        "results_truncated": has_more, "has_more": has_more,
         "next_start_frame": next_frame,
+        "next_cursor": encode_cursor(next_frame, digest, scope) if has_more else None,
+        "scan_range": {"start_frame": position, "end_frame": end_frame},
+        "truncation": {
+            "page_truncated": has_more, "output_truncated": False,
+            "field_values_truncated": any("truncated_fields" in r for r in matches[:limit]),
+            "window_may_have_more_frames": True,
+        },
         "coverage": coverage,
         "search": {"fields": fields, "match_field": match_field, "match_mode": match_mode,
                    "host_ip": ip},
@@ -177,14 +204,19 @@ def _decode_tcp_row(row: dict) -> dict | None:
     frame = int(row.get("frame.number") or 0)
     seq = row.get("tcp.seq_raw") or row.get("tcp.seq")
     if not frame or not seq or not seq.isdecimal():
-        return None
+        raise PacketSleuthError(
+            "TShark returned a TCP segment without a valid frame or sequence",
+            code="PARSER_FAILURE",
+        )
     field = row.get("tcp.payload") or ""
     if not field:
         data = b""
     else:
         field = field.replace(":", "")
         if len(field) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", field):
-            raise PacketSleuthError("Malformed TShark TCP payload encoding")
+            raise PacketSleuthError(
+                "Malformed TShark TCP payload encoding", code="PARSER_FAILURE"
+            )
         data = bytes.fromhex(field)
     return {
         "frame": frame, "seq": int(seq), "data": data,
@@ -274,7 +306,9 @@ def reconstruct_tcp(
                                scan_limit=end_frame)
     segments = [item for row in rows if (item := _decode_tcp_row(row)) is not None]
     if len(segments) > MAX_TCP_SEGMENTS:
-        raise PacketSleuthError("Too many TCP segments in window; narrow scan_frames")
+        raise PacketSleuthError(
+            "Too many TCP segments in window; narrow scan_frames", code="OUTPUT_LIMIT"
+        )
     directions = Counter(item["key"] for item in segments)
     candidates = [
         {"src_ip": key[0], "src_port": key[1], "dst_ip": key[2],
@@ -301,7 +335,10 @@ def reconstruct_tcp(
         return base | {"status": "no_payload_in_window", "available_bytes": 0,
                        "note": "No TCP payload in this frame window/direction."}
     if len({item["seq_source"] for item in selected}) > 1:
-        raise PacketSleuthError("Inconsistent TCP sequence fields; cannot reconstruct safely")
+        raise PacketSleuthError(
+            "Inconsistent TCP sequence fields; cannot reconstruct safely",
+            code="PARSER_FAILURE",
+        )
     # Direction-specific raw TCP sequence numbers, unwrapped around the first
     # captured segment. Works across 32-bit rollover for windows shorter than 2 GiB.
     anchor = selected[0]["seq"]
@@ -312,7 +349,10 @@ def reconstruct_tcp(
     span = max(pos + max(len(item["data"]), item["reported_length"])
                for pos, item in zip(positions, selected))
     if span > MAX_TCP_BYTES:
-        raise PacketSleuthError("TCP sequence span exceeds 512 KiB; narrow the frame window")
+        raise PacketSleuthError(
+            "TCP sequence span exceeds 512 KiB; narrow the frame window",
+            code="OUTPUT_LIMIT",
+        )
     payload = bytearray(span)
     observed = bytearray(span)
     conflict_frames = []
