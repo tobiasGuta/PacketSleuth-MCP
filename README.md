@@ -89,7 +89,11 @@ These tools are **general-purpose**: they do not contain capture-specific IPs, r
 
 If `results_truncated` is true, the returned `next_start_frame` points to the frame following the final returned match. If false, it points to the first frame after the scanned window. Repeat your query with the returned cursor and the same search constraints to continue. A cursor is a **candidate**, not proof that later frames exist or that the entire capture has been scanned. Every response identifies the requested window and pins the capture SHA-256.
 
-Existing `query_flows`, `query_events`, and `query_tcp_segments` still accept `offset` and return `next_offset`, but now also support `cursor` and `next_cursor` **within a frame window**. Continue with the same filters, capture hash, and frame window. A cursor is rejected when the parameters or capture contents change. After the window, use `coverage.next_start_frame`. Flow aggregation is scoped to one window: a long flow may appear in multiple windows. Do not add window-level flow counts and call them full-session totals.
+Existing `query_flows`, `query_events`, and `query_tcp_segments` still accept `offset` and return `next_offset`, but now also support `cursor` and `next_cursor` **within a frame window**. Continue with the same filters, capture hash, and frame window. A cursor is rejected when the parameters or capture contents change. After the window, use `coverage.next_start_frame`.
+
+**Cursor integrity:** New (v2) continuation tokens are HMAC-authenticated for a single MCP server process. Tokens cannot be edited to skip positions without detection. They expire on server restart or upgrade; restart pagination from the beginning of the same pinned capture after reconnecting. Earlier v1 cursor tokens are not accepted by the new decoder; legacy numeric `offset` and `next_start_frame` parameters remain available. The decoded query result must have valid, unique frame IDs; packet pages sort by frame and fail explicitly with `PARSER_FAILURE` instead of silently dropping duplicate or malformed frame rows. Flow pages use deterministic tie-breakers to avoid unstable ordering.
+
+**Complete traversal:** `has_more=false` means no more matching results *inside the selected frame window*, not the end of the capture. Exhaust the window using `next_cursor`, then move to `coverage.next_start_frame` and exhaust the next bounded window. Compare the union of frame IDs against an independent reference when validating forensic completeness. Flow aggregation is scoped to one window: a long flow may appear in multiple windows. Do not add window-level flow counts and call them full-session totals.
 
 ## Complete DNS evidence
 
@@ -123,6 +127,10 @@ frame exceeds the configured parser budget, the tool returns an explicit
 
 MCP tools return their normal payload on success. Expected failures return
 `{"ok":false,"error":{"code":"...","message":"...","retryable":false}}`.
+The MCP response now sets `isError=true` for expected failures, including
+Pydantic/SDK argument-validation errors that occur before the Python tool
+function executes. The strict input schemas are unchanged; error details
+include safe argument field names, never the rejected values.
 Stable error codes are `INVALID_INPUT`, `CAPTURE_NOT_FOUND`,
 `PARSER_FAILURE`, `TIMEOUT`, `OUTPUT_LIMIT`, and
 `UNSUPPORTED_OPERATION`. The Python API retains exception behavior. Unknown

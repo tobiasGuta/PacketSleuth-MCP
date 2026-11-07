@@ -297,3 +297,180 @@ def test_parser_fault_codes_do_not_look_like_bad_analyst_input():
     with pytest.raises(PacketSleuthError) as exc:
         _decode_tcp_row({"frame.number": "1", "tcp.seq": ""})
     assert exc.value.code == "PARSER_FAILURE"
+
+
+class ManyDNSRunner(FrameRunner):
+    """Synthetic DNS rows at non-contiguous frames, with stable PDML evidence."""
+
+    def __init__(self, frames):
+        super().__init__()
+        self.rows = [{
+            "frame.number": str(frame),
+            "frame.time_epoch": str(1_700_000_000 + frame),
+            "ip.src": "192.0.2.10", "ip.dst": "198.51.100.53",
+            "dns.id": str(frame % 65536),
+            "dns.flags.response": "0",
+            "dns.qry.name": f"sample{frame}.invalid",
+            "dns.qry.type": "1",
+        } for frame in frames]
+
+    def dns_details(self, path, frames, scan_limit):
+        return {
+            frame: ET.fromstring(
+                '<packet><proto name="dns">'
+                '<field name="dns.count.answers" show="0"/>'
+                '</proto></packet>'
+            )
+            for frame in frames
+        }
+
+
+def test_complete_dns_traversal_across_windows_without_duplicates(tmp_path):
+    from packetsleuth.dns import query_dns
+
+    store, pin = make_capture(tmp_path)
+    # Ninety-two events are deliberately sparse and span a 250-frame boundary.
+    reference = list(range(4, 369, 4))
+    assert len(reference) == 92
+    engine = InvestigationEngine(store, ManyDNSRunner(reference))
+    capture = store.list()[0]["capture_id"]
+
+    all_frames = []
+    for window_start in (1, 251):
+        used_cursors = set()
+        cursor = None
+        expected_in_window = [
+            frame for frame in reference if window_start <= frame <= window_start + 249
+        ]
+        while True:
+            response = query_dns(
+                engine, capture, pin, start_frame=window_start,
+                scan_frames=250, limit=10, cursor=cursor,
+            )
+            assert response["sha256"] == pin
+            assert response["matched_in_window"] == len(expected_in_window)
+            assert response["scan_range"] == {
+                "start_frame": window_start,
+                "end_frame": window_start + 249,
+            }
+            current = [event["frame"] for event in response["events"]]
+            assert current == sorted(current)
+            all_frames.extend(current)
+            if not response["has_more"]:
+                assert response["next_cursor"] is None
+                break
+            assert response["next_cursor"] not in used_cursors
+            used_cursors.add(response["next_cursor"])
+            cursor = response["next_cursor"]
+            # Cursor replay must return the same data.
+            assert query_dns(
+                engine, capture, pin, start_frame=window_start,
+                scan_frames=250, limit=10, cursor=cursor,
+            )["events"] == query_dns(
+                engine, capture, pin, start_frame=window_start,
+                scan_frames=250, limit=10, cursor=cursor,
+            )["events"]
+
+    assert len(all_frames) == 92
+    assert len(set(all_frames)) == 92
+    assert all_frames == reference
+
+
+def test_dns_cursor_tampering_mismatched_scope_and_capture_hash(tmp_path):
+    import base64
+    import json
+
+    from packetsleuth.dns import query_dns
+
+    store, pin = make_capture(tmp_path)
+    engine = InvestigationEngine(store, ManyDNSRunner([2, 4, 6, 8]))
+    capture = store.list()[0]["capture_id"]
+    args = dict(start_frame=1, scan_frames=10, limit=2)
+    first = query_dns(engine, capture, pin, **args)
+    cursor = first["next_cursor"]
+    assert cursor
+
+    token = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+    token["p"] = 999
+    tampered = base64.urlsafe_b64encode(
+        json.dumps(token).encode()
+    ).decode().rstrip("=")
+    with pytest.raises(PacketSleuthError, match="authentication"):
+        query_dns(engine, capture, pin, cursor=tampered, **args)
+
+    with pytest.raises(PacketSleuthError, match="does not match"):
+        query_dns(
+            engine, capture, pin, cursor=cursor,
+            **(args | {"max_records_per_message": 10}),
+        )
+    with pytest.raises(PacketSleuthError, match="does not match"):
+        query_dns(
+            engine, capture, pin, cursor=cursor,
+            **(args | {"host_ip": "203.0.113.44"}),
+        )
+
+    path = store.get(capture)
+    path.write_bytes(path.read_bytes() + b"x")
+    with pytest.raises(PacketSleuthError, match="mismatch"):
+        query_dns(engine, capture, pin, cursor=cursor, **args)
+
+
+def test_canonical_frame_sorting_and_invalid_offsets(tmp_path):
+    from packetsleuth.pagination import page, stable_frame_rows
+
+    rows = [{"frame.number": str(frame)} for frame in (3, 1, 2)]
+    assert [r["frame.number"] for r in stable_frame_rows(rows)] == ["1", "2", "3"]
+    for invalid in (rows + [{"frame.number": "2"}], [{"frame.number": "abc"}]):
+        with pytest.raises(PacketSleuthError) as exc:
+            stable_frame_rows(invalid)
+        assert exc.value.code == "PARSER_FAILURE"
+
+    with pytest.raises(PacketSleuthError, match="outside"):
+        page([{"frame": 1}], 10, 99, "0" * 64, {}, 1, 10)
+
+    store, _ = make_capture(tmp_path)
+    runner = FrameRunner()
+    runner.rows.reverse()
+    engine = InvestigationEngine(store, runner)
+    events = engine.query_events(store.list()[0]["capture_id"], "dns", scan_frames=8)
+    assert [event["frame"] for event in events["events"]] == list(range(1, 9))
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_mcp_argument_validation_and_runtime_errors_have_same_error_envelope():
+    from mcp import Client
+
+    from packetsleuth.server import mcp
+
+    async with Client(mcp, raise_exceptions=True) as client:
+        tools = await client.list_tools()
+        assert tools  # Tool listing succeeded; response wrapping varies by SDK version.
+
+        invalid_enum = await client.call_tool(
+            "query_events", {"capture_id": "0" * 24, "protocol": "ftp"}
+        )
+        assert invalid_enum.is_error is True
+        assert invalid_enum.structured_content["ok"] is False
+        assert invalid_enum.structured_content["error"]["code"] == "INVALID_INPUT"
+        assert "protocol" in invalid_enum.structured_content["error"]["details"]["fields"]
+
+        invalid_type = await client.call_tool(
+            "query_events", {"capture_id": "0" * 24, "protocol": "dns", "limit": "wrong"}
+        )
+        assert invalid_type.is_error is True
+        assert invalid_type.structured_content["error"]["code"] == "INVALID_INPUT"
+
+        missing = await client.call_tool(
+            "query_events", {"capture_id": "0" * 24, "protocol": "dns"}
+        )
+        assert missing.is_error is True
+        assert missing.structured_content["error"]["code"] == "CAPTURE_NOT_FOUND"
+
+        healthy = await client.call_tool("healthcheck", {})
+        assert healthy.is_error is False
+        assert healthy.content  # Successful result shape remains backward-compatible.

@@ -12,7 +12,7 @@ from xml.etree import ElementTree as ET
 
 from packetsleuth.core import PacketSleuthError, _clip, _validate_ip
 from packetsleuth.forensics import _assert_unchanged, _capture_pinned, _check_window
-from packetsleuth.pagination import decode_cursor, page
+from packetsleuth.pagination import decode_cursor, page, stable_frame_rows
 
 if TYPE_CHECKING:
     from packetsleuth.core import InvestigationEngine
@@ -202,6 +202,7 @@ def query_dns(
                 row.get("ipv6.src"), row.get("ipv6.dst"),
             )
         ]
+    rows = stable_frame_rows(rows)
     offset = decode_cursor(cursor, digest, scope, 0, len(rows))
     selected, meta = page(rows, limit, offset, digest, scope, start_frame, end_frame)
     frame_numbers = [_integer(r.get("frame.number")) for r in selected]

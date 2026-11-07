@@ -582,10 +582,12 @@ class InvestigationEngine:
             display_filter = None
         else:
             display_filter = frame_filter
-        rows = self.runner.query(
+        from packetsleuth.pagination import stable_frame_rows
+
+        rows = stable_frame_rows(self.runner.query(
             path, display_filter=display_filter,
             scan_limit=MAX_SCAN_FRAMES if display_filter is None else end_frame,
-        )
+        ))
         flows: dict[tuple, dict] = {}
         for r in rows:
             src = r.get("ip.src") or r.get("ipv6.src") or ""
@@ -612,7 +614,14 @@ class InvestigationEngine:
                 flow["sample_frames"].append(int(r.get("frame.number") or 0))
         for flow in flows.values():
             flow["sample_frames_truncated"] = flow["packets"] > len(flow["sample_frames"])
-        output = sorted(flows.values(), key=lambda item: item["bytes"], reverse=True)
+        output = sorted(
+            flows.values(),
+            key=lambda item: (
+                -item["bytes"], item["protocol"], str(item["stream_id"]),
+                item["src_ip"], str(item["src_port"]),
+                item["dst_ip"], str(item["dst_port"]),
+            ),
+        )
         scope = {
             "tool": "query_flows", "capture_id": capture_id,
             "start_frame": start_frame, "scan_frames": scan_frames, "host_ip": ip,
@@ -645,7 +654,7 @@ class InvestigationEngine:
         offset: int = 0,
         cursor: str | None = None,
     ) -> dict:
-        from packetsleuth.pagination import decode_cursor, page
+        from packetsleuth.pagination import decode_cursor, page, stable_frame_rows
 
         limit = _validate_limit(limit)
         offset = _validate_offset(offset)
@@ -666,6 +675,7 @@ class InvestigationEngine:
                 path, display_filter=f"({display_filter}) && ({frame_filter})",
                 scan_limit=end_frame,
             )
+        rows = stable_frame_rows(rows)
         scope = {
             "tool": "query_events", "capture_id": capture_id, "protocol": protocol,
             "host_ip": ip, "start_frame": start_frame, "scan_frames": scan_frames,
@@ -737,7 +747,7 @@ class InvestigationEngine:
         cursor: str | None = None,
     ) -> dict:
         """Page raw TCP segments by frame window without claiming reassembly."""
-        from packetsleuth.pagination import decode_cursor, page
+        from packetsleuth.pagination import decode_cursor, page, stable_frame_rows
 
         if type(stream_id) is not int or not 0 <= stream_id <= 1_000_000:
             raise PacketSleuthError("stream_id must be from 0 to 1000000")
@@ -762,6 +772,7 @@ class InvestigationEngine:
                             f"&& ({frame_filter})"),
             scan_limit=end_frame,
         )
+        rows = stable_frame_rows(rows)
         scope = {
             "tool": "query_tcp_segments", "capture_id": capture_id,
             "stream_id": stream_id, "start_frame": start_frame,
