@@ -8,7 +8,7 @@ from typing import Literal
 
 from mcp.server import MCPServer
 
-from packetsleuth import forensics, icmp
+from packetsleuth import forensics, icmp, icmp_flow
 from packetsleuth.core import CaptureStore, InvestigationEngine
 
 capture_root = Path(os.environ.get("PACKETSLEUTH_CAPTURE_DIR", "./captures"))
@@ -84,6 +84,22 @@ def inspect_icmp_payload(
 ) -> dict:
     """Verify and extract bounded ICMPv4/v6 Echo data from one captured frame."""
     return icmp.inspect_icmp_payload(engine, capture_id, frame, expected_sha256, max_bytes)
+
+
+@mcp.tool()
+def reconstruct_icmp_flow(
+    capture_id: str, expected_sha256: str, start_frame: int = 1,
+    scan_frames: int = 100, host_ip: str | None = None,
+    peer_ip: str | None = None, identifier: int | None = None,
+    protocol: Literal["icmpv4", "icmpv6"] | None = None,
+    max_packets: int = 16,
+    reconstruction_mode: Literal["none", "request", "reply"] = "none",
+) -> dict:
+    """Bounded Echo request/reply correlation; optional candidate-only concatenation."""
+    return icmp_flow.reconstruct_icmp_flow(
+        engine, capture_id, expected_sha256, start_frame, scan_frames,
+        host_ip, peer_ip, identifier, protocol, max_packets, reconstruction_mode,
+    )
 
 
 @mcp.tool()
