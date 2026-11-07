@@ -100,12 +100,15 @@ def query_packets(
     host_ip: str | None = None,
     start_frame: int = 1, scan_frames: int = 250, limit: int = 25,
     expected_sha256: str | None = None,
+    cursor: str | None = None,
 ) -> dict:
     """Search a bounded frame window and page by *frame number*, not result offset.
 
     The matching operation happens in Python on a fixed set of decoded fields,
     avoiding user-supplied display-filter expressions and injection issues.
     """
+    from packetsleuth.pagination import decode_cursor, encode_cursor
+
     if fields is None:
         fields = list(DEFAULT_FIELDS)
     if not isinstance(fields, list) or not 1 <= len(fields) <= MAX_QUERY_FIELDS:
@@ -129,6 +132,14 @@ def query_packets(
                                      *((match_field,) if match_field else ()),
                                      *(("ip.src", "ip.dst", "ipv6.src", "ipv6.dst") if ip else ()))))
     path, digest = _capture_pinned(engine, capture_id, expected_sha256)
+    scope = {
+        "tool": "query_packets", "capture_id": capture_id, "fields": fields,
+        "match_field": match_field, "match_value": match_value, "match_mode": match_mode,
+        "host_ip": ip, "start_frame": start_frame, "scan_frames": scan_frames,
+    }
+    position = decode_cursor(cursor, digest, scope, start_frame, end_frame)
+    if position != start_frame:
+        frame_filter = f"frame.number >= {position} && frame.number <= {end_frame}"
     rows = engine.runner.query(path, fields=requested, display_filter=frame_filter,
                                scan_limit=end_frame)
     matches = []
@@ -145,15 +156,22 @@ def query_packets(
         matches.append({field: _clip(row.get(field, ""), 256) for field in fields}
                        | {"frame": int(row["frame.number"])})
     _assert_unchanged(path, digest)
-    if len(matches) > limit:
-        next_frame = matches[limit - 1]["frame"] + 1
-    else:
-        next_frame = coverage["next_start_frame"]
+    has_more = len(matches) > limit
+    next_frame = (
+        matches[limit - 1]["frame"] + 1
+        if has_more else coverage["next_start_frame"]
+    )
     return {
         "capture_id": capture_id, "sha256": digest, "records": matches[:limit],
         "matched_in_window": len(matches), "returned": min(len(matches), limit),
-        "results_truncated": len(matches) > limit,
+        "results_truncated": has_more, "has_more": has_more,
         "next_start_frame": next_frame,
+        "next_cursor": encode_cursor(next_frame, digest, scope) if has_more else None,
+        "scan_range": {"start_frame": position, "end_frame": end_frame},
+        "truncation": {
+            "page_truncated": has_more, "output_truncated": False,
+            "window_may_have_more_frames": True,
+        },
         "coverage": coverage,
         "search": {"fields": fields, "match_field": match_field, "match_mode": match_mode,
                    "host_ip": ip},

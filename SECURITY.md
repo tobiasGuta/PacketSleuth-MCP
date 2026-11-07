@@ -10,6 +10,22 @@ PacketSleuth is experimental forensic software. It is **not** certified secure f
 4. Treat exposed credentials, personally identifying information, and private communications as sensitive. Choose an MCP client whose telemetry and model-data controls satisfy your organization.
 5. Do not rely on signature hints, simple heuristics, or an AI verdict as a substitute for forensic validation.
 
+## Failure handling and runtime configuration
+
+MCP expected errors use explicit `ok=false` envelopes with stable error codes.
+Parser failures, timeouts and exceeded output limits do not masquerade as empty
+successful pages. Frame cursors are tied to the capture SHA-256 and exact filter
+scope; they cannot certify full-capture coverage. Subprocess groups are killed
+and reaped on timeout or cancellation, but deployment still requires OS-level
+CPU, memory, disk, and privilege restrictions. Bounded capture, scan, output and
+runtime limits can be configured via the documented `PACKETSLEUTH_*` environment
+variables, within hard ceilings.
+
+DNS dissection relies on TShark PDML for per-record fields and TTLs. Unknown,
+invalid, or excessively large DNS messages may have incomplete decoded records;
+the tool marks that status explicitly. DNS names and answers are untrusted and
+should not be executed, clicked, or resolved through external services.
+
 ## Bounded operations
 
 MCP tools execute predetermined TShark commands without a shell or arbitrary display filters. Inputs are validated. New v0.3 tools run on bounded frame windows and compare the capture SHA-256 before/after processing; these protections do not prevent all native parser exploits, filesystem races, resource exhaustion or prompt injection. ICMP flow correlation is explicitly window-scoped and never claims that sequential Echo messages constitute a byte stream. Optional candidate concatenation is bounded, requires complete/consistent evidence, and is not proof of exfiltration. ICMP Echo extraction rejects fragmented, truncated, or ambiguous layouts; its raw payload bytes and hashes are evidence, not proof of tunneling or exfiltration. TCP reconstruction reports missing ranges, overlap conflicts, and scope limitations; it cannot prove that a full connection or application object was captured.
